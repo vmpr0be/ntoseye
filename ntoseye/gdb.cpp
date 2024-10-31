@@ -273,7 +273,7 @@ public:
 
     inline bool bad()
     {
-        return gdb_pid == 0;
+        return gdb_pid <= 0;
     }
 
     inline void sigint()

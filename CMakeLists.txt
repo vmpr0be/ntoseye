@@ -13,4 +13,4 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 file(GLOB GLOBBED_SOURCES CONFIGURE_DEPENDS "ntoseye/*.cpp")
 
 add_executable(ntoseye ${GLOBBED_SOURCES})
-target_link_libraries(ntoseye tbb readline Zydis lua dl m curl LLVM lldb)
+target_link_libraries(ntoseye readline Zydis lua dl m curl LLVM lldb)
