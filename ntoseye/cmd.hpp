@@ -127,4 +127,6 @@ namespace cmd {
     
     std::string read_line(const char *s);
     bool read_yes_no(const char* s);
-}
+
+    std::string get_current_command();
+ }

@@ -64,7 +64,6 @@
 #include <filesystem>
 #include <print>
 #include <algorithm>
-#include <execution>
 
 using namespace llvm::codeview;
 

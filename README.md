@@ -11,7 +11,7 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU.
 - Kernel debugging
 - PDB fetching
 - Breakpointing
-- Scripting API (Lua)
+- Plugin API (C)
 
 ### Supported Windows
 
@@ -27,25 +27,22 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU.
 
 | Name | Version |
 | ---- | ------- |
-| [CMake](https://cmake.org/) | 3.5+ |
-| [GCC](https://gcc.gnu.org/) | 14+ |
-| [GDB](https://www.sourceware.org/gdb/) | Latest |
+| [CMake](https://cmake.org/) | 3.15+ |
 | [libreadline](www.gnu.org/software/readline/) | Latest |
 | [Zydis](https://github.com/zyantific/zydis) | Latest |
 | [LLVM](https://llvm.org/) | 15+ |
-| [Lua](https://www.lua.org/) | 5.3+ |
-| [sol2](https://github.com/ThePhD/sol2) | Latest |
 | [curl](https://curl.se/) | Latest |
+
+> [!IMPORTANT]
+> A compiler with C++23 support is required. GDB is also required for control flow capabilities (e.g. breakpoints).
 
 ## Building
 
 ```bash
 git clone https://github.com/dmaivel/ntoseye.git
 cd ntoseye
-mkdir build
-cd build
-cmake ..
-cmake --build . --config Release
+cmake -B build
+cmake --build build --config Release
 ```
 
 # Usage
@@ -106,11 +103,11 @@ Add the following to the XML configuration:
 | `~ OR ~ [ProcessorNumber]` | Display current processor number or set current processor. |
 | `:[CallbackName] <Args>` | Call to Lua callback. |
 
-## Lua API
+## C API
 
-For scripts to be visible to `ntoseye`, they need to be stored in `$XDG_CONFIG_HOME/ntoseye/scripts/`. This folder is create automatically when you run `ntoseye` for the first time.
+For plugins to be visible to `ntoseye`, they need to be stored in `$XDG_CONFIG_HOME/ntoseye/plugins/`. This folder is created automatically when you run `ntoseye` for the first time.
 
-There are a few example lua scripts provided in `./examples`. Documentation is not available yet.
+For functionality, look at examples in `examples/` or the public header `include/ntoseye/ntoseye.h`.
 
 ## Credits
 

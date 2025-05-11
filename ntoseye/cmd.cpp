@@ -16,6 +16,7 @@ struct internal_callback {
 };
 
 std::map<std::string, internal_callback> global_callbacks;
+static std::string current_command("");
 
 void cmd::register_callback(const std::string &cmd, const callback &callback, const std::string &custom_completion)
 {
@@ -37,6 +38,7 @@ cmd::status cmd::attempt_callback(const std::string &fullcmd, mem::process &curr
     // remove command
     auto command = *args.begin();
     args.erase(args.begin());
+    current_command = command;
                             
     return global_callbacks.contains(command) 
             ? global_callbacks[command].callback(args, current_process)
@@ -123,4 +125,9 @@ bool cmd::read_yes_no(const char* s)
 
     std::puts("Please answer either y or [n].");
     return read_yes_no(s);
+}
+
+std::string cmd::get_current_command()
+{
+    return current_command;
 }

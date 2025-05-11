@@ -3,7 +3,6 @@
 #include "gdb.hpp"
 #include "guest.hpp"
 #include "log.hpp"
-#include "lua.hpp"
 #include "util.hpp"
 #include "mem.hpp"
 
@@ -234,10 +233,6 @@ void dbg::install_builtin_commands()
 
     cmd::register_callback("q", [&](const std::vector<std::string> &args, mem::process &current_process) -> cmd::status {
         return cmd::status::unknown_command("if you see this, something went very wrong");
-    });
-
-    cmd::register_callback("reload_lua", [&](const std::vector<std::string> &args, mem::process &current_process) -> cmd::status {
-        return lua::initialize() ? cmd::status::success() : cmd::status::invalid_argument("failed to re-initialize lua");
     });
 
     cmd::register_callback("n", [&](const std::vector<std::string> &args, mem::process &current_process) -> cmd::status {

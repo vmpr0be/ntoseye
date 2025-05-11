@@ -1,9 +1,9 @@
+#include "capi.hpp"
 #include "cmd.hpp"
 #include "curl.hpp"
 #include "dbg.hpp"
 #include "host.hpp"
 #include "guest.hpp"
-#include "lua.hpp"
 #include "log.hpp"
 #include "gdb.hpp"
 
@@ -47,8 +47,7 @@ int main(int argc, char **argv)
 
     dbg::install_builtin_commands();
 
-    if (!lua::initialize())
-        return 1;
+    capi::initialize();
 
     cmd::initialize_readline();
 
