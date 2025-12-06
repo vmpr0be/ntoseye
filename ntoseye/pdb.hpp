@@ -8,6 +8,24 @@
 #include "mem.hpp"
 
 namespace pdb {
+     struct ntos_offsets {
+        int64_t active_process_links,
+                session,
+                session_id,
+                client_id,
+                stack_count,
+                image_filename,
+                dir_base,
+                peb,
+                thread_list_head,
+                teb,
+                vad_root,
+                parent_client_id,
+                object_table;
+    };
+
+    ntos_offsets get_ntoskrnl_offsets();
+
     constexpr int max_download_attempts = 2;
 
     enum class process_priv {

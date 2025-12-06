@@ -1,4 +1,6 @@
 #include <atomic>
+#include <cassert>
+#include <cstdio>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/DebugInfo/CodeView/CVSymbolVisitor.h>
@@ -17,8 +19,11 @@
 #include <llvm/DebugInfo/CodeView/SymbolDeserializer.h>
 #include <llvm/DebugInfo/CodeView/SymbolVisitorCallbackPipeline.h>
 #include <llvm/DebugInfo/CodeView/SymbolVisitorCallbacks.h>
+#include <llvm/DebugInfo/CodeView/TypeDeserializer.h>
 #include <llvm/DebugInfo/CodeView/TypeHashing.h>
+#include <llvm/DebugInfo/CodeView/TypeIndex.h>
 #include <llvm/DebugInfo/CodeView/TypeIndexDiscovery.h>
+#include <llvm/DebugInfo/CodeView/TypeRecord.h>
 #include <llvm/DebugInfo/MSF/MappedBlockStream.h>
 #include <llvm/DebugInfo/PDB/Native/DbiModuleDescriptor.h>
 #include <llvm/DebugInfo/PDB/Native/DbiStream.h>
@@ -68,6 +73,7 @@
 using namespace llvm::codeview;
 
 std::vector<pdb::symbol> symbols;
+static pdb::ntos_offsets ntoskrnl_offsets;
 
 static std::string get_pdb_path_from_storage(pdb::metadata &metadata)
 {
@@ -122,7 +128,7 @@ static bool attempt_get_symbols(pdb::metadata metadata, const std::string &prefi
 
     auto expected_symbol_stream = file->pdb().getPDBSymbolStream();
     if (!expected_symbol_stream) {
-        // std::println("Failed to get symbol stream ({})", toString(expected_symbol_stream.takeError()));
+        std::print("Failed to get symbol stream ({})", out::name(prefix));
         return false;
     }
 
@@ -141,12 +147,92 @@ static bool attempt_get_symbols(pdb::metadata metadata, const std::string &prefi
         }
     });
 
+    // getting ntoskrnl offsets
+
+    std::string ntoskrnl = "ntoskrnl";
+
+    if (prefix != ntoskrnl) {
+        return true;
+    }
+
+    auto expected_type_stream = file->pdb().getPDBTpiStream();
+    if (!expected_type_stream) {
+        std::print("Failed to get type stream ({})", out::name(prefix));
+        return false;
+    }
+
+    auto &type_stream = *expected_type_stream;
+
+    struct ProcessTpiStream : public TypeVisitorCallbacks {
+        ProcessTpiStream() {}
+
+        llvm::Error visitKnownMember(CVMemberRecord &cvr, DataMemberRecord &member) override {
+            if (!member.Name.empty()) {
+                std::string field_name = member.getName().str();
+                auto offset = member.getFieldOffset();
+
+                // _EPROCESS
+                if (field_name == "ActiveProcessLinks") ntoskrnl_offsets.active_process_links = offset;
+                if (field_name == "Session") ntoskrnl_offsets.session = offset;
+                if (field_name == "UniqueProcessId") ntoskrnl_offsets.client_id = offset;
+                if (field_name == "StackCount") ntoskrnl_offsets.stack_count = offset;
+                if (field_name == "ImageFileName") ntoskrnl_offsets.image_filename = offset;
+                if (field_name == "DirectoryTableBase") ntoskrnl_offsets.dir_base = offset;
+                if (field_name == "Peb") ntoskrnl_offsets.peb = offset;
+                if (field_name == "VadRoot") ntoskrnl_offsets.vad_root = offset;
+                if (field_name == "InheritedFromUniqueProcessId") ntoskrnl_offsets.parent_client_id = offset;
+                if (field_name == "ObjectTable") ntoskrnl_offsets.object_table = offset;
+
+                // _MM_SESSION_SPACE
+                if (field_name == "SessionId") ntoskrnl_offsets.session_id = offset;
+            }
+
+            return llvm::ErrorSuccess();
+        } 
+    };
+
+    std::string e_process = "_EPROCESS";
+    std::string k_process = "_KPROCESS";
+    std::string mm_session_space = "_MM_SESSION_SPACE";
+
+    for (uint32_t type_index = type_stream.TypeIndexBegin(); type_index < type_stream.TypeIndexEnd(); ++type_index) {
+        auto cv_type = type_stream.getType(TypeIndex(type_index));
+
+        if (cv_type.kind() == TypeLeafKind::LF_STRUCTURE) {
+            auto class_record = cantFail(TypeDeserializer::deserializeAs<ClassRecord>(cv_type.RecordData));
+            auto class_name = class_record.Name.str();
+
+            if (class_name == e_process || class_name == k_process || class_name == mm_session_space) {
+                auto member_count = class_record.getMemberCount();
+
+                if (member_count == 0) {
+                    continue;
+                }
+                    
+                // TODO error handling
+
+                auto field_list_type = type_stream.getType( class_record.getFieldList());
+                auto field_list = cantFail(TypeDeserializer::deserializeAs<FieldListRecord>(field_list_type.RecordData));
+
+                ProcessTpiStream process;
+
+                if (llvm::Error error = visitMemberRecordStream(field_list.Data, process))
+                    llvm::consumeError(std::move(error));
+            }
+        }
+    }
+
     return true;
+}
+
+pdb::ntos_offsets pdb::get_ntoskrnl_offsets()
+{
+    return ntoskrnl_offsets;
 }
 
 void pdb::load(mem::process &process, process_priv priv)
 {
-    static auto prompt_message = "Current process/modules may have undownloaded symbols. Would you like to download them? (y/[n]): ";
+    //static auto prompt_message = "Current process/modules may have undownloaded symbols. Would you like to download them? (y/[n]): ";
 
     std::atomic_int success_count = 0, fail_count = 0;
 
@@ -180,7 +266,10 @@ void pdb::load(mem::process &process, process_priv priv)
     else
         modules = util::get_modules(process);
 
-    auto should_download = cmd::read_yes_no(prompt_message);
+    // required currently for automatically retrieving offsets
+    //auto should_download = cmd::read_yes_no(prompt_message);
+    auto should_download = true;
+
     if (!should_download)
         return;
 
