@@ -9,7 +9,7 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU.
 - Command line interface
 - WinDbg style commands
 - Kernel debugging
-- PDB fetching
+- PDB fetching & parsing for offsets
 - Breakpointing
 - Plugin API (C)
 
@@ -19,7 +19,7 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU.
 
 ### Disclaimer
 
-`ntoseye` will ask you if you wish to download symbols (defaults to exports if user declines). It will only download symbols from Microsoft's official symbol server. All files which will be read/written to will be located in `$XDG_CONFIG_HOME/ntoseye`.
+`ntoseye` needs to download symbols to initialize required offsets, it will only download symbols from Microsoft's official symbol server. All files which will be read/written to will be located in `$XDG_CONFIG_HOME/ntoseye`.
 
 ### Preview
 
