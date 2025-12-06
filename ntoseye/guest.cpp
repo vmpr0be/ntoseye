@@ -7,6 +7,7 @@
 
 #include "windefs.h"
 
+#include <cassert>
 #include <cstdint>
 #include <limits>
 
@@ -49,7 +50,6 @@ static uintptr_t mm_pxe_self = 0;
 
 static mem::process ntoskrnl_process;
 static std::vector<util::symbol> ntoskrnl_symbols;
-static guest::ntos_offsets ntoskrnl_offsets;
 
 static auto get_ntoskrnl_entry() -> uint64_t
 {
@@ -167,55 +167,6 @@ static uint32_t get_ntos_build()
     return 0;
 }
 
-// https://www.gaijin.at/en/infos/windows-version-numbers
-static bool set_ntos_offsets(uint16_t version, uint32_t build)
-{
-    switch (version) {
-    case 1000: /* W10 */
-        ntoskrnl_offsets = (guest::ntos_offsets){
-            .active_process_links = 0x2e8,
-            .session = 0x448,
-            .session_id = 0x8,
-            .client_id = 0x440,
-            .stack_count = 0x23c,
-            .image_filename = 0x450,
-            .dir_base = 0x28,
-            .peb = 0x3f8,
-            .peb32 = 0x30,
-            .thread_list_head = 0x488,
-            .thread_list_entry = 0x6a8,
-            .teb = 0xf0,
-            .vad_root = 0x7d8,
-            .parent_client_id = 0x540,
-            .object_table = 0x570,
-        };
-
-        if (build >= 18362) { /* Version 1903 or higher */
-            ntoskrnl_offsets.active_process_links = 0x2f0;
-            ntoskrnl_offsets.thread_list_entry = 0x6b8;
-        }
-
-        if (build >= 19041) { /* Version 2004 or higher */
-            ntoskrnl_offsets.active_process_links = 0x448;
-            ntoskrnl_offsets.stack_count = 0x348;
-            ntoskrnl_offsets.image_filename = 0x5a8;
-            ntoskrnl_offsets.peb = 0x550;
-            ntoskrnl_offsets.thread_list_head = 0x5e0;
-            ntoskrnl_offsets.thread_list_entry = 0x4e8;
-            ntoskrnl_offsets.session = 0x558;
-        }
-
-        if (build >= 19045) {
-
-        }
-
-        break;
-    default:
-        return false;
-    }
-    return true;
-}
-
 bool guest::initialize()
 {
     if (!get_ntoskrnl_base_address(get_ntoskrnl_entry())) {
@@ -226,10 +177,20 @@ bool guest::initialize()
     auto nt_version = get_ntos_version();
     auto nt_build = get_ntos_build();
 
-    if (!set_ntos_offsets(nt_version, nt_build)) {
-        out::error("failed to get ntoskrnl offsets\n");
-        return false;
-    }
+    // REQUIRED, loads offsets
+    pdb::load(ntoskrnl_process, pdb::process_priv::kernel);
+
+    // TODO proper error handling for uninitialized offsets?
+    assert(pdb::get_ntoskrnl_offsets().active_process_links != 0);
+    assert(pdb::get_ntoskrnl_offsets().session != 0);
+    assert(pdb::get_ntoskrnl_offsets().client_id != 0);
+    assert(pdb::get_ntoskrnl_offsets().stack_count != 0);
+    assert(pdb::get_ntoskrnl_offsets().image_filename != 0);
+    assert(pdb::get_ntoskrnl_offsets().dir_base != 0);
+    assert(pdb::get_ntoskrnl_offsets().peb != 0);
+    assert(pdb::get_ntoskrnl_offsets().vad_root != 0);
+    assert(pdb::get_ntoskrnl_offsets().parent_client_id != 0);
+    assert(pdb::get_ntoskrnl_offsets().object_table != 0);
 
     auto initial_system_process = util::get_proc_address(ntoskrnl_symbols, "PsInitialSystemProcess");
     ntoskrnl_process.virtual_process = ntoskrnl_process.read<uint64_t>(initial_system_process);
@@ -243,8 +204,6 @@ bool guest::initialize()
     std::print("Kernel base = {} PsLoadedModuleList = {}\n\n", 
             out::address(ntoskrnl_process.base_address, out::fmt::x, out::prefix::with_prefix), 
             out::address(util::get_proc_address(ntoskrnl_symbols, "PsLoadedModuleList"), out::fmt::x, out::prefix::with_prefix));
-
-    pdb::load(ntoskrnl_process, pdb::process_priv::kernel);
 
     uint8_t mi_get_pte_address_signature[] = "\x48\xc1\xe9\x09\x48\xb8\xf8\xff\xff\xff\x7f\x00\x00\x00\x48\x23\xc8\x48\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x48\x03\xc1\xc3";
     char mi_get_pte_address_mask[] = "xxxxxxxxxxxxxxxxxxx????????xxxx";
@@ -270,11 +229,6 @@ bool guest::initialize()
 mem::process guest::get_ntoskrnl_process()
 {
     return ntoskrnl_process;
-}
-
-guest::ntos_offsets guest::get_ntoskrnl_offsets()
-{
-    return ntoskrnl_offsets;
 }
 
 std::vector<util::module> guest::get_kernel_modules()
@@ -313,7 +267,7 @@ bool guest::query_process_basic_info(uint64_t &physical_process, uint64_t &virtu
         virtual_process = ntoskrnl_process.virtual_process;
     }
     else {
-        virtual_process = host::read_kvm_memory<uint64_t>(physical_process + ntoskrnl_offsets.active_process_links) - ntoskrnl_offsets.active_process_links;
+        virtual_process = host::read_kvm_memory<uint64_t>(physical_process + pdb::get_ntoskrnl_offsets().active_process_links) - pdb::get_ntoskrnl_offsets().active_process_links;
         if (!virtual_process)
             return false;
 
@@ -322,19 +276,23 @@ bool guest::query_process_basic_info(uint64_t &physical_process, uint64_t &virtu
             return false;
     }
 
-    current_process.process_id = host::read_kvm_memory<uint64_t>(physical_process + ntoskrnl_offsets.active_process_links - 8);
+    current_process.process_id = host::read_kvm_memory<uint64_t>(physical_process + pdb::get_ntoskrnl_offsets().active_process_links - 8);
     current_process.physical_process = physical_process;
     current_process.virtual_process = virtual_process;
 
-    current_process.set_dir_base(host::read_kvm_memory<uint64_t>(physical_process + ntoskrnl_offsets.dir_base));
+    current_process.set_dir_base(host::read_kvm_memory<uint64_t>(physical_process + pdb::get_ntoskrnl_offsets().dir_base));
 
-    util::set_process_peb(current_process, ntoskrnl_offsets.peb);
+    util::set_process_peb(current_process, pdb::get_ntoskrnl_offsets().peb);
 
-    current_process.win_dbg_data.session_id = ntoskrnl_process.read<uint32_t>(host::read_kvm_memory<uint64_t>(physical_process + ntoskrnl_offsets.session) + ntoskrnl_offsets.session_id);
-    current_process.win_dbg_data.client_id = host::read_kvm_memory<uint64_t>(physical_process + ntoskrnl_offsets.client_id);
-    current_process.win_dbg_data.peb_address = host::read_kvm_memory<uint64_t>(physical_process + ntoskrnl_offsets.peb);
-    current_process.win_dbg_data.parent_client_id = host::read_kvm_memory<uint64_t>(physical_process + ntoskrnl_offsets.parent_client_id);
-    current_process.win_dbg_data.object_table_address = host::read_kvm_memory<uint64_t>(physical_process + ntoskrnl_offsets.object_table);
+    current_process.win_dbg_data.session_id = ntoskrnl_process.read<uint32_t>(
+        host::read_kvm_memory<uint64_t>(
+            physical_process + pdb::get_ntoskrnl_offsets().session
+        ) + pdb::get_ntoskrnl_offsets().session_id
+    );
+    current_process.win_dbg_data.client_id = host::read_kvm_memory<uint64_t>(physical_process + pdb::get_ntoskrnl_offsets().client_id);
+    current_process.win_dbg_data.peb_address = host::read_kvm_memory<uint64_t>(physical_process + pdb::get_ntoskrnl_offsets().peb);
+    current_process.win_dbg_data.parent_client_id = host::read_kvm_memory<uint64_t>(physical_process + pdb::get_ntoskrnl_offsets().parent_client_id);
+    current_process.win_dbg_data.object_table_address = host::read_kvm_memory<uint64_t>(physical_process + pdb::get_ntoskrnl_offsets().object_table);
 
     return true;
 }
@@ -346,15 +304,15 @@ mem::process guest::find_process(const std::string &name)
     mem::process current_process;
 
     while (query_process_basic_info(physical_process, virtual_process, current_process)) {
-        auto stack_count = host::read_kvm_memory<uint64_t>(physical_process + ntoskrnl_offsets.stack_count);
+        auto stack_count = host::read_kvm_memory<uint64_t>(physical_process + pdb::get_ntoskrnl_offsets().stack_count);
 
         if (current_process.process_id < std::numeric_limits<int>::max() && stack_count) {
             auto base_module = util::get_module(current_process, {});
 
             if (name == base_module.name.c_str()) {
 
-                auto physical_vad_root = physical_process + ntoskrnl_offsets.vad_root;
-                auto vad_count = current_process.read<uint64_t>(physical_process + ntoskrnl_offsets.vad_root + 0x10);
+                auto physical_vad_root = physical_process + pdb::get_ntoskrnl_offsets().vad_root;
+                auto vad_count = current_process.read<uint64_t>(physical_process + pdb::get_ntoskrnl_offsets().vad_root + 0x10);
     
                 std::vector<uint64_t> visit;
 

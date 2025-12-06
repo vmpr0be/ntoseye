@@ -7,28 +7,9 @@
 #include <string>
 
 namespace guest {
-    struct ntos_offsets {
-        int64_t active_process_links,
-                session,
-                session_id,
-                client_id,
-                stack_count,
-                image_filename,
-                dir_base,
-                peb,
-                peb32,
-                thread_list_head,
-                thread_list_entry,
-                teb,
-                vad_root,
-                parent_client_id,
-                object_table;
-    };
-
     bool initialize();
 
     mem::process get_ntoskrnl_process();
-    ntos_offsets get_ntoskrnl_offsets();
 
     std::vector<util::module> get_kernel_modules();
 
