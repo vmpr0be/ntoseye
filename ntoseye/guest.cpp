@@ -10,6 +10,8 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <vector>
+#include <set>
 
 static uintptr_t mm_pte_base = 0;
 static uintptr_t mm_pde_base = 0;
@@ -51,77 +53,253 @@ static uintptr_t mm_pxe_self = 0;
 static mem::process ntoskrnl_process;
 static std::vector<util::symbol> ntoskrnl_symbols;
 
-static auto get_ntoskrnl_entry() -> uint64_t
+// TODO i dont like the magic numbers scattered about, should have intuitive names
+// TODO function uses hardcoded 256 / 512, should use PTE_PER_PAGE?
+static bool verify_pml4(const uint8_t *page, uint64_t pa)
 {
-    char buf[0x10000];
+    const uint64_t *ptes = reinterpret_cast<const uint64_t*>(page);
+    int kernel_valid = 0;
+    int user_zero = 0;
+    int kernel_zero = 0;
+    bool self_ref = false;
 
-    for (int i = 0; i < 10; i++) {
-        host::read_kvm_memory(buf, i * 0x10000, 0x10000);
-        
-        for (int o = 0; o < 0x10000; o += 0x1000) {
-            // start bytes
-            if (0x00000001000600E9 ^ (0xffffffffffff00ff & *(uint64_t*)(void*)(buf + o)))
+    // check user-mode PTEs (first 256 entries)
+    for (int i = 0; i < 256; i++)
+        if (ptes[i] == 0)
+            user_zero++;
+
+    // check kernel-mode PTEs (last 256 entries)
+    for (int i = 256; i < 512; i++) {
+        if (ptes[i] == 0) {
+            kernel_zero++;
+            continue;
+        }
+
+        // check for valid supervisor entry
+        if ((ptes[i] & 0x8000000000000087ULL) == 0x03) {
+            uint64_t pdpt_pa = mem::pte_to_pa(ptes[i]);
+
+            if (pdpt_pa < 0x10000000000ULL)
+                kernel_valid++;
+        }
+
+        // check for self-referential entry
+        if ((ptes[i] & 0x0000fffffffff083ULL) == (pa | 0x03))
+            self_ref = true;
+    }
+
+    return self_ref && (kernel_valid >= 6) && (user_zero > 0x40) && (kernel_zero > 0x40);
+}
+
+static bool scan_large_pages(
+    uint64_t pa_table,
+    uint64_t va_base,
+    uint64_t va_min,
+    uint64_t va_max,
+    int level,
+    uint64_t &out_va_base,
+    uint64_t &out_size)
+{
+    static const uint64_t PML_REGION_SIZE[] = { 0, 12, 21, 30, 39 };
+
+    if (level < 2)
+        return false;
+
+    std::vector<uint8_t> page(0x1000);
+    if (!host::read_kvm_memory(page.data(), pa_table, 0x1000))
+        return false;
+
+    if (level == 4) {
+        if (!verify_pml4(page.data(), pa_table))
+            return false;
+
+        va_base = 0;
+        out_va_base = 0;
+        out_size = 0;
+    }
+
+    const uint64_t *ptes = reinterpret_cast<const uint64_t*>(page.data());
+
+    for (int i = 0; i < PTE_PER_PAGE; i++) {
+        uint64_t va_current = mem::sign_extend_48bit(va_base + (static_cast<uint64_t>(i) << PML_REGION_SIZE[level]));
+
+        if (out_va_base && (va_current > (out_va_base + out_size)))
+            return out_size > 0;
+        if (va_current < va_min)
+            continue;
+        if (va_current > va_max)
+            return out_size > 0;
+
+        uint64_t pte = ptes[i];
+
+        if (!mem::is_pte_valid(pte))
+            continue;
+
+        if (level == 2) {
+            if (!mem::is_large_page(pte))
                 continue;
 
-            // kernel entry
-            if (0xfffff80000000000 ^ (0xfffff80000000000 & *(uint64_t*)(void*)(buf + o + 0x70)))
+            if (out_va_base == 0)
+                out_va_base = va_current;
+
+            out_size += 0x200000; // 2 MiB
+            continue;
+        }
+
+        if (mem::is_large_page(pte))
+            continue;
+
+        uint64_t next_table = mem::pte_to_pa(pte);
+        if (scan_large_pages(next_table, va_current, va_min, va_max, level - 1, out_va_base, out_size))
+            return true;
+    }
+
+    return out_size > 0;
+}
+
+static void scan_small_pages_worker(
+    uint64_t pa_table,
+    uint64_t va_base,
+    uint64_t va_min,
+    uint64_t va_max,
+    int level,
+    std::set<uint64_t> &candidates)
+{
+    static const uint64_t PML_REGION_SIZE[] = { 0, 12, 21, 30, 39 };
+
+    if (level == 0)
+        return;
+
+    std::vector<uint8_t> page(0x1000);
+    if (!host::read_kvm_memory(page.data(), pa_table, 0x1000))
+        return;
+
+    if (level == 4) {
+        if (!verify_pml4(page.data(), pa_table))
+            return;
+
+        va_base = 0;
+    }
+
+    const uint64_t *ptes = reinterpret_cast<const uint64_t*>(page.data());
+
+    for (int i = 0; i < PTE_PER_PAGE; i++) {
+        uint64_t va_current = mem::sign_extend_48bit(va_base + (static_cast<uint64_t>(i) << PML_REGION_SIZE[level]));
+
+        if (va_current < va_min)
+            continue;
+        if (va_current > va_max)
+            return;
+
+        uint64_t pte = ptes[i];
+        if (!mem::is_pte_valid(pte))
+            continue;
+
+        if (level == 1) {
+            // page i-1 is empty
+            // page i is ACTIVE-WRITE-SUPERVISOR-NOEXECUTE 0x8000000000000003
+            // pages i+1 to i+31 are ACTIVE-SUPERVISOR 0x01
+
+            if (i == 0)
+                continue;
+            if (ptes[i - 1] != 0)
+                continue;
+            if ((pte & 0x800000000000000fULL) != 0x8000000000000003ULL)
                 continue;
 
-            // pml4
-            if (0xffffff0000000fff & *(uint64_t*)(void*)(buf + o + 0xa0))
+            bool valid = true;
+            for (int j = i + 2; j < std::min(i + 32, 512); j++)
+                if ((ptes[j] & 0x0f) != 0x01) {
+                    valid = false;
+                    break;
+                }
+
+            if (valid)
+                candidates.insert(va_current);
+            continue;
+        }
+
+        if (mem::is_large_page(pte))
+            continue;
+
+        uint64_t next_table = mem::pte_to_pa(pte);
+        scan_small_pages_worker(next_table, va_current, va_min, va_max, level - 1, candidates);
+    }
+}
+
+static auto get_ntoskrnl_base_address() -> uint64_t
+{
+    constexpr uint64_t KERNEL_VA_MIN = 0xfffff80000000000ULL;
+    constexpr uint64_t KERNEL_VA_MAX = 0xfffff807ffffffffULL;
+
+    for (uint64_t pa_dtb = 0x1000; pa_dtb < 0x1000000; pa_dtb += 0x1000) {
+        std::vector<uint8_t> page(0x1000);
+        if (!host::read_kvm_memory(page.data(), pa_dtb, 0x1000))
+            continue;
+
+        if (!verify_pml4(page.data(), pa_dtb))
+            continue;
+
+        ntoskrnl_process.set_dir_base(pa_dtb);
+
+        uint64_t kernel_base = 0;
+        uint64_t kernel_size = 0;
+
+        if (scan_large_pages(pa_dtb, 0, KERNEL_VA_MIN, KERNEL_VA_MAX, 4, kernel_base, kernel_size)) {
+            if (kernel_size >= 0x400000 && kernel_size < 0x1800000) {
+                std::vector<uint8_t> kernel_buf(kernel_size);
+                if (ntoskrnl_process.read_bytes(kernel_buf.data(), kernel_base, kernel_size)) {
+                    for (size_t p = 0; p < kernel_size; p += 0x1000) {
+                        // MZ
+                        if (*(uint16_t*)(kernel_buf.data() + p) != 0x5a4d)
+                            continue;
+
+                        bool found_poolcode = false;
+                        for (size_t o = 0; o < 0x1000; o += 8)
+                            if (*(uint64_t*)(kernel_buf.data() + p + o) == 0x45444F434C4F4F50ULL) {
+                                found_poolcode = true;
+                                break;
+                            }
+
+                        if (found_poolcode)
+                            return kernel_base + p;
+                    }
+                }
+            }
+        }
+
+        out::warn("large page scan failed, trying small page scan\n");
+        std::set<uint64_t> candidates;
+        scan_small_pages_worker(pa_dtb, 0, KERNEL_VA_MIN, KERNEL_VA_MAX, 4, candidates);
+
+        for (uint64_t va : candidates) {
+            std::vector<uint8_t> page_buf(0x1000);
+            if (!ntoskrnl_process.read_bytes(page_buf.data(), va, 0x1000))
                 continue;
 
-            ntoskrnl_process.set_dir_base(*(uint64_t*)(void*)(buf + o + 0xa0));
-            return *(uint64_t*)(void*)(buf + o + 0x70);
+            // MZ
+            if (*(uint16_t*)(page_buf.data()) != 0x5a4d)
+                continue;
+
+            // poolcode
+            for (size_t o = 0; o < 0x1000; o += 8)
+                if (*(uint64_t*)(page_buf.data() + o) == 0x45444F434C4F4F50ULL)
+                    return va;
         }
     }
 
     return 0;
 }
 
-static bool get_ntoskrnl_base_address(uint64_t kernel_entry)
-{
-    uint64_t i, o, p, u, mask = 0xfffff;
-    char buf[0x10000];
-
-    while (mask >= 0xfff) {
-        for (i = (kernel_entry & ~0x1fffff) + 0x20000000; i > kernel_entry - 0x20000000; i -= 0x200000) {
-            for (o = 0; o < 0x20; o++) {
-                ntoskrnl_process.read_bytes(buf, i + 0x10000 * o, sizeof(buf));
-
-                for (p = 0; p < 0x10000; p += 0x1000) {
-                    if (((i + 0x1000 * o + p) & mask) == 0 && *(short*)(void*)(buf + p) == IMAGE_DOS_SIGNATURE) {
-                        int kdbg = 0, pool_code = 0;
-                        for (u = 0; u < 0x1000; u++) {
-                            kdbg = kdbg || *(uint64_t*)(void*)(buf + p + u) == 0x4742444b54494e49;
-                            pool_code = pool_code || *(uint64_t*)(void*)(buf + p + u) == 0x45444f434c4f4f50;
-                            if (kdbg & pool_code) {
-                                ntoskrnl_process.base_address = i + 0x10000 * o + p;
-                                
-                                ntoskrnl_symbols = util::get_process_exports(ntoskrnl_process);
-                                if (ntoskrnl_symbols.empty())
-                                    break;
-
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        mask = mask >> 4;
-    }
-
-    return false;
-}
-
 static uint16_t get_ntos_version()
 {
     auto get_version = util::get_proc_address(ntoskrnl_symbols, "RtlGetVersion");
 
-    auto buffer = ntoskrnl_process.read<util::page_4kb_buffer>(get_version);
-    auto buf = buffer.data;
+    std::vector<uint8_t> page(0x1000);
+    if (!ntoskrnl_process.read_bytes(page.data(), get_version, 0x1000))
+        return 0;
+
+    auto buf = page.data();
 
     char major = 0, minor = 0;
 
@@ -154,8 +332,11 @@ static uint32_t get_ntos_build()
 
     uint64_t get_version = util::get_proc_address(ntoskrnl_symbols, "RtlGetVersion");
 
-    auto buffer = ntoskrnl_process.read<util::page_4kb_buffer>(get_version);
-    auto buf = buffer.data;
+    std::vector<uint8_t> page(0x1000);
+    if (!ntoskrnl_process.read_bytes(page.data(), get_version, 0x1000))
+        return 0;
+
+    auto buf = page.data();
 
     // rcx + 12
     for (char* b = (char*)buf; b - (char*)buf < 0xf0; b++) {
@@ -169,10 +350,14 @@ static uint32_t get_ntos_build()
 
 bool guest::initialize()
 {
-    if (!get_ntoskrnl_base_address(get_ntoskrnl_entry())) {
+    // TODO make this a cleaner process, maybe dedicated ntoskrnl namespace
+    ntoskrnl_process.base_address = get_ntoskrnl_base_address();
+    if (!ntoskrnl_process.base_address) {
         out::error("failed to get ntoskrnl base address\n");
         return false;
     }
+
+    ntoskrnl_symbols = util::get_process_exports(ntoskrnl_process);
 
     auto nt_version = get_ntos_version();
     auto nt_build = get_ntos_build();
@@ -201,8 +386,8 @@ bool guest::initialize()
     query_process_basic_info(a, b, ntoskrnl_process);
 
     std::print("Windows Kernel Version {}\n", out::value(nt_build));
-    std::print("Kernel base = {} PsLoadedModuleList = {}\n\n", 
-            out::address(ntoskrnl_process.base_address, out::fmt::x, out::prefix::with_prefix), 
+    std::print("Kernel base = {} PsLoadedModuleList = {}\n",
+            out::address(ntoskrnl_process.base_address, out::fmt::x, out::prefix::with_prefix),
             out::address(util::get_proc_address(ntoskrnl_symbols, "PsLoadedModuleList"), out::fmt::x, out::prefix::with_prefix));
 
     uint8_t mi_get_pte_address_signature[] = "\x48\xc1\xe9\x09\x48\xb8\xf8\xff\xff\xff\x7f\x00\x00\x00\x48\x23\xc8\x48\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x48\x03\xc1\xc3";
@@ -216,7 +401,7 @@ bool guest::initialize()
     }
 
     auto mi_get_pte_address = util::find_pattern(ntoskrnl_process, ntoskrnl_process.base_address + section->VirtualAddress, section->SizeOfRawData, mi_get_pte_address_signature, mi_get_pte_address_mask);
-    
+
     mm_pte_base = ntoskrnl_process.read<uint64_t>(mi_get_pte_address + 0x13);
     mm_pde_base = mm_pte_base + (mm_pte_base >> 9 & 0x7FFFFFFFFF);
     mm_ppe_base = mm_pde_base + (mm_pde_base >> 9 & 0x3FFFFFFF);
@@ -313,7 +498,7 @@ mem::process guest::find_process(const std::string &name)
 
                 auto physical_vad_root = physical_process + pdb::get_ntoskrnl_offsets().vad_root;
                 auto vad_count = current_process.read<uint64_t>(physical_process + pdb::get_ntoskrnl_offsets().vad_root + 0x10);
-    
+
                 std::vector<uint64_t> visit;
 
                 visit.push_back(physical_vad_root);

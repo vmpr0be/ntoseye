@@ -53,7 +53,7 @@ cmake --build build --config Release
 
 `ntoseye` takes in no arguments to launch. It is recommended that you run the following command before running `ntoseye` or a VM:
 ```bash
-echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope 
+echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
 ```
 
 Note that you may need to run `ntoseye` with `sudo` aswell.
@@ -119,3 +119,4 @@ Functionality regarding initialization of guest information was written with the
 
 - [vmread](https://github.com/h33p/vmread)
 - [pcileech](https://github.com/ufrisk/pcileech)
+- [MemProcFS](https://github.com/ufrisk/MemProcFS)

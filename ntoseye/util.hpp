@@ -15,12 +15,8 @@ namespace util {
         uint64_t address;
     };
 
-    struct page_4kb_buffer {
-        uint8_t data[0x1000];
-    };
-
     struct module {
-        mem::process process; // sub-optimal; needed for util::get_module_exports
+        mem::process process; // FIXME sub-optimal; needed for util::get_module_exports
         std::string name;
         uint64_t base_address;
 
@@ -52,7 +48,7 @@ namespace util {
 
     std::string string_tolower(const std::string &string);
     std::string string_toupper(const std::string &string);
-    
+
     static inline std::string string_replace(std::string string, const std::string_view &from, const std::string_view &to)
     {
         for (size_t pos = 0; (pos = string.find(from, pos)) != std::string::npos; pos += to.length())

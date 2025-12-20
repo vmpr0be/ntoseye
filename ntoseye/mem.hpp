@@ -14,7 +14,7 @@
 
 #include <immintrin.h>
 
-// to-do: phase out, this was only meant for debugging
+// TODO phase out, this was only meant for debugging
 #define VMM_MAX_ATTEMPTS    2
 
 #define PAGE_SHIFT          12
@@ -33,6 +33,29 @@ struct windbg_process_data {
 };
 
 namespace mem {
+    // TODO introduced these functions, should use them elsewhere (already in guest.cpp)
+    // or possibly add more helpers to make virtual memory introspection
+    // more intuitive
+    static constexpr uint64_t sign_extend_48bit(uint64_t va)
+    {
+        return (va & 0x0000800000000000ULL) ? (va | 0xffff000000000000ULL) : va;
+    }
+
+    static constexpr bool is_pte_valid(uint64_t pte)
+    {
+        return (pte & 0x01) != 0;
+    }
+
+    static constexpr bool is_large_page(uint64_t pte)
+    {
+        return (pte & 0x80) != 0;
+    }
+
+    static constexpr uint64_t pte_to_pa(uint64_t pte)
+    {
+        return pte & 0x0000fffffffff000ULL;
+    }
+
     class process {
     private:
         ssize_t read_virtual_memory(void *local_address, uint64_t remote_address, size_t length);
@@ -74,8 +97,8 @@ namespace mem {
                 return result;
 
             for (
-                ssize_t remaining = 0; 
-                remaining < sizeof(T); 
+                ssize_t remaining = 0;
+                remaining < sizeof(T);
             ) {
                 auto read = read_virtual_memory((char*)&result + remaining, remote_address + remaining, sizeof(T) - remaining);
                 if (read == -1) {
@@ -103,8 +126,8 @@ namespace mem {
             int missed_attempts = 0;
 
             for (
-                ssize_t remaining = 0; 
-                remaining < sizeof(T); 
+                ssize_t remaining = 0;
+                remaining < sizeof(T);
             ) {
                 auto read = write_virtual_memory((char*)&data + remaining, remote_address + remaining, sizeof(T) - remaining);
                 if (read == -1) {

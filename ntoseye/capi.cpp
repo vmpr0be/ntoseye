@@ -43,10 +43,10 @@ extern "C" EXPORT NTProcess NT_GetCurrentProcess()
 extern "C" EXPORT int NT_RegisterCallback(NTCallbackProc proc, char *name)
 {
     auto cmd = std::format(":{}", name);
-    
+
     if (plugin_callbacks.contains(cmd))
         return 0;
-    
+
     plugin_callbacks[cmd] = proc;
     cmd::register_callback(cmd, rerouter);
 
@@ -65,7 +65,7 @@ bool capi::initialize()
     std::filesystem::create_directories(plugins_directory);
 
     /*
-     * to-do: ask user if they really wanna load the plugin?
+     * TODO ask user if they really wanna load the plugin?
      */
     std::ranges::all_of(std::filesystem::directory_iterator(plugins_directory),
                         [&](auto dir_entry) {
