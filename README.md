@@ -2,7 +2,7 @@
 
 # ntoseye ![license](https://img.shields.io/badge/license-MIT-blue)
 
-Windows kernel debugger for Linux hosts running Windows under KVM/QEMU.
+Windows kernel debugger for Linux hosts running Windows under KVM/QEMU. Essentially, WinDbg for Linux.
 
 ## Features
 
@@ -11,7 +11,6 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU.
 - Kernel debugging
 - PDB fetching & parsing for offsets
 - Breakpointing
-- Plugin API (C)
 
 ### Supported Windows
 
@@ -23,40 +22,34 @@ Windows kernel debugger for Linux hosts running Windows under KVM/QEMU.
 
 ### Preview
 
-![ntos](https://github.com/user-attachments/assets/aacfe685-6656-4e6f-8563-ed9e7b6b110f)
+![ntos](media/preview.png)
 
 # Getting started
 
-## Dependencies
+## Install via cargo
 
-| Name | Version |
-| ---- | ------- |
-| [CMake](https://cmake.org/) | 3.15+ |
-| [libreadline](www.gnu.org/software/readline/) | Latest |
-| [Zydis](https://github.com/zyantific/zydis) | Latest |
-| [LLVM](https://llvm.org/) | 15+ |
-| [curl](https://curl.se/) | Latest |
-
-> [!IMPORTANT]
-> A compiler with C++23 support is required. GDB is also required for control flow capabilities (e.g. breakpoints).
+```bash
+cargo install ntoseye
+```
 
 ## Building
 
 ```bash
 git clone https://github.com/dmaivel/ntoseye.git
 cd ntoseye
-cmake -B build
-cmake --build build --config Release
+cargo build --release
 ```
 
 # Usage
 
-`ntoseye` takes in no arguments to launch. It is recommended that you run the following command before running `ntoseye` or a VM:
+It is recommended that you run the following command before running `ntoseye` or a VM:
 ```bash
 echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
 ```
 
-Note that you may need to run `ntoseye` with `sudo` aswell.
+Note that you may need to run `ntoseye` with `sudo` aswell (last resort, try command above first).
+
+To view command line arguments, run `ntoseye --help`. The debugger is self documented, so pressing tab will display completions and descriptions for commands, symbols, and types.
 
 ## VM configuration
 
@@ -78,40 +71,6 @@ Add the following to the XML configuration:
   </qemu:commandline>
 </domain>
 ```
-
-## Keybinds
-
-| Key(s) | Description |
-| - | - |
-| <kbd>tab</kbd> | Tab completion. Either lists all available commands or attempts to complete the currently typed out command. |
-| <kbd>ctrl+C</kbd> | Attempt a breakpoint. Will terminate the debugger if in the middle of a download or hang. |
-
-## Commands
-
-| Command                           | Description                                                |
-|-----------------------------------|------------------------------------------------------------|
-| `!pte [VirtualAddress/Symbol]` | Display the page table entries of a given virtual address. |
-| `!process 0 0` | Display a list of the current active processes. |
-| `.process [/p /r] OR [AddressOfEPROCESS]` | Set the current process context. |
-| `break` | Breakpoint. |
-| `db [VirtualAddress/Symbol] [EndAddress/L<Count>]` | Display bytes at address. |
-| `g` | Continue from breakpoint. |
-| `lm` | List current modules. |
-| `n [10 OR 16]` | Set radix. 16 by default. |
-| `q` | Quit. |
-| `r OR r [Register names]` | Display registers. |
-| `reload_lua` | Reload lua scripts. |
-| `u [VirtualAddress/Symbol] [EndAddress/L<Count>]` | Display disassembly at address. |
-| `uf [VirtualAddress/Symbol] [EndAddress/L<Count>]` | Alias for `u` command. |
-| `x [Module!Function]` | Display symbols matching the string. Accepts wildcard. |
-| `~ OR ~ [ProcessorNumber]` | Display current processor number or set current processor. |
-| `:[CallbackName] <Args>` | Call to Lua callback. |
-
-## C API
-
-For plugins to be visible to `ntoseye`, they need to be stored in `$XDG_CONFIG_HOME/ntoseye/plugins/`. This folder is created automatically when you run `ntoseye` for the first time.
-
-For functionality, look at examples in `examples/` or the public header `include/ntoseye/ntoseye.h`.
 
 ## Credits
 
