@@ -68,21 +68,80 @@ impl Prompt for CustomPrompt {
     }
 }
 
-struct CustomColorHighlighter;
-
-impl Highlighter for CustomColorHighlighter {
-    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
-        let mut styled_text = StyledText::new();
-        let input_style = Style::new().fg(Color::LightGray);
-        styled_text.push((input_style, line.to_string()));
-        styled_text
-    }
-}
-
 enum CompletionStrategy {
     None,
     Symbol,
     Type,
+}
+
+fn make_suggestions(
+    names: Vec<String>,
+    description: &str,
+    arg_start: usize,
+    prefix_offset: usize,
+    pos: usize,
+) -> Vec<Suggestion> {
+    names
+        .into_iter()
+        .map(|name| Suggestion {
+            value: name,
+            description: Some(description.to_string()),
+            style: None,
+            extra: None,
+            match_indices: None,
+            span: Span::new(arg_start + prefix_offset, pos),
+            append_whitespace: true,
+        })
+        .collect()
+}
+
+macro_rules! require_arg {
+    ($parts:expr, $idx:expr, $cmd:expr) => {
+        match $parts.get($idx) {
+            Some(a) => *a,
+            None => {
+                println!("{}\n", $cmd.get_message().unwrap_or("invalid usage"));
+                continue;
+            }
+        }
+    };
+}
+
+struct AddressRange {
+    start: VirtAddr,
+    end: VirtAddr,
+}
+
+impl AddressRange {
+    fn parse(
+        parts: &[&str],
+        debugger: &DebuggerContext,
+        default_length: u64,
+    ) -> Result<Self, String> {
+        let start_arg = parts.get(1).ok_or_else(|| "missing start address".to_string())?;
+        let start = DebuggerArgument::new(start_arg).resolve(debugger)?;
+
+        let end = if let Some(end_arg) = parts.get(2) {
+            let end = DebuggerArgument::new(end_arg).resolve(debugger)?;
+            if end.0 < start.0 {
+                end + start.0
+            } else {
+                end
+            }
+        } else {
+            start + default_length
+        };
+
+        if end.0 < start.0 {
+            return Err("end address must be greater than or equal to start address".to_string());
+        }
+
+        Ok(AddressRange { start, end })
+    }
+
+    fn len(&self) -> usize {
+        (self.end.0 - self.start.0) as usize
+    }
 }
 
 // TODO ps, lm, attach, br, removebr, enablebr, disablebr, continue/g
@@ -181,20 +240,8 @@ impl Completer for MyCompleter {
                 CompletionStrategy::None => return vec![],
 
                 CompletionStrategy::Symbol => {
-                    return self
-                        .symbols
-                        .search(prefix, 1024)
-                        .into_iter()
-                        .map(|name| Suggestion {
-                            value: name,
-                            description: Some("Symbol".to_string()),
-                            style: None,
-                            extra: None,
-                            match_indices: None,
-                            span: Span::new(arg_start + prefix_offset, pos),
-                            append_whitespace: true,
-                        })
-                        .collect();
+                    let results = self.symbols.search(prefix, 1024);
+                    return make_suggestions(results, "Symbol", arg_start, prefix_offset, pos);
                 }
 
                 CompletionStrategy::Type => {
@@ -203,37 +250,14 @@ impl Completer for MyCompleter {
                         arg_count += 1;
                     }
 
-                    if arg_count > 2 {
-                        return self
-                            .symbols
-                            .search(prefix, 1024)
-                            .into_iter()
-                            .map(|name| Suggestion {
-                                value: name,
-                                description: Some("Symbol".to_string()),
-                                style: None,
-                                extra: None,
-                                match_indices: None,
-                                span: Span::new(arg_start + prefix_offset, pos),
-                                append_whitespace: true,
-                            })
-                            .collect();
-                    }
+                    let (index, description) = if arg_count > 2 {
+                        (&self.symbols, "Symbol")
+                    } else {
+                        (&self.types, "Structure")
+                    };
 
-                    return self
-                        .types
-                        .search(prefix, 1024)
-                        .into_iter()
-                        .map(|name| Suggestion {
-                            value: name,
-                            description: Some("Structure".to_string()),
-                            style: None,
-                            extra: None,
-                            match_indices: None,
-                            span: Span::new(arg_start + prefix_offset, pos),
-                            append_whitespace: true,
-                        })
-                        .collect();
+                    let results = index.search(prefix, 1024);
+                    return make_suggestions(results, description, arg_start, prefix_offset, pos);
                 }
             }
         }
@@ -244,11 +268,6 @@ impl Completer for MyCompleter {
 
 fn error(msg: &str) {
     eprintln!("{} {}", "error:".red(), msg);
-}
-
-fn fatal_error(msg: &str) -> ! {
-    error(msg);
-    std::process::exit(1)
 }
 
 macro_rules! error {
@@ -265,7 +284,7 @@ fn hexdump(start_address: VirtAddr, data: &[u8]) {
             print!("{:02x} ", byte);
         }
 
-        for i in chunk.len()..16 {
+        for _ in chunk.len()..16 {
             print!("   ");
         }
 
@@ -331,7 +350,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
     println!("{}", splash_text);
 
     // TODO make this non-fatal
-    let mut client = GdbClient::connect("127.0.0.1:1234").map_err(|e| "failed to connect to gdbstub")?;
+    let mut client = GdbClient::connect("127.0.0.1:1234").map_err(|_| "failed to connect to gdbstub")?;
 
     let min_completion_width: u16 = 0;
     let max_completion_width: u16 = 50;
@@ -420,16 +439,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                             break;
                         }
                         Ok(ReplCommand::Pte) => {
-                            let arg = match parts.get(1) {
-                                Some(a) => a,
-                                None => {
-                                    println!(
-                                        "{}\n",
-                                        ReplCommand::Pte.get_message().unwrap_or("invalid usage")
-                                    );
-                                    continue;
-                                }
-                            };
+                            let arg = require_arg!(parts, 1, ReplCommand::Pte);
                             let arg = DebuggerArgument::new(arg);
                             match debugger.pte_traverse(arg) {
                                 Ok(result) => {
@@ -464,71 +474,41 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                             }
                         }
                         Ok(ReplCommand::Db) => {
-                            let start_address = DebuggerArgument::new(match parts.get(1) {
-                                Some(a) => a,
-                                None => {
-                                    println!(
-                                        "{}\n",
-                                        ReplCommand::Db.get_message().unwrap_or("invalid usage")
-                                    );
+                            let range = match AddressRange::parse(&parts, debugger, 128) {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    println!("{}\n", ReplCommand::Db.get_message().unwrap_or("invalid usage"));
                                     continue;
                                 }
-                            })
-                            .resolve(debugger)?;
+                            };
 
-                            let default_end = format!("{:#x}", start_address.0 + 128);
-                            let mut end = DebuggerArgument::new(match parts.get(2) {
-                                Some(e) => e,
-                                None => &default_end,
-                            })
-                            .resolve(debugger)?;
-
-                            if end.0 < start_address.0 {
-                                end = end + start_address.0;
-                            }
-
-                            let mut data: Vec<u8> = vec![0u8; (end.0 - start_address.0) as usize];
+                            let mut data: Vec<u8> = vec![0u8; range.len()];
                             debugger
                                 .get_current_process()
                                 .memory(&debugger.kvm)
-                                .read_bytes(start_address, &mut data)?;
+                                .read_bytes(range.start, &mut data)?;
 
-                            hexdump(start_address, &data);
+                            hexdump(range.start, &data);
                         }
                         Ok(ReplCommand::Disasm) => {
-                            let start_address = DebuggerArgument::new(match parts.get(1) {
-                                Some(a) => a,
-                                None => {
-                                    println!(
-                                        "{}\n",
-                                        ReplCommand::Db.get_message().unwrap_or("invalid usage")
-                                    );
+                            let range = match AddressRange::parse(&parts, debugger, 32) {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    println!("{}\n", ReplCommand::Disasm.get_message().unwrap_or("invalid usage"));
                                     continue;
                                 }
-                            })
-                            .resolve(debugger)?;
+                            };
 
-                            let default_end = format!("{:#x}", start_address.0 + 32);
-                            let mut end = DebuggerArgument::new(match parts.get(2) {
-                                Some(e) => e,
-                                None => &default_end,
-                            })
-                            .resolve(debugger)?;
-
-                            if end.0 < start_address.0 {
-                                end = end + start_address.0;
-                            }
-
-                            let mut bytes: Vec<u8> = vec![0u8; (end.0 - start_address.0) as usize];
+                            let mut bytes: Vec<u8> = vec![0u8; range.len()];
                             debugger
                                 .get_current_process()
                                 .memory(&debugger.kvm)
-                                .read_bytes(start_address, &mut bytes)?;
+                                .read_bytes(range.start, &mut bytes)?;
 
                             let mut decoder = Decoder::with_ip(
                                 64, /* TODO dont hardcode for WOW64 process? */
                                 &bytes,
-                                start_address.0,
+                                range.start.0,
                                 DecoderOptions::NONE,
                             );
 
@@ -556,7 +536,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                                 formatter.format(&instruction, &mut output);
 
                                 print!("{:016x} ", VirtAddr(instruction.ip()));
-                                let start_index = (instruction.ip() - start_address.0) as usize;
+                                let start_index = (instruction.ip() - range.start.0) as usize;
                                 let instr_bytes =
                                     &bytes[start_index..start_index + instruction.len()];
                                 for b in instr_bytes.iter() {
@@ -661,19 +641,10 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                             }
                         }
                         Ok(ReplCommand::Dt) => {
-                            let arg = match parts.get(1) {
-                                Some(a) => a,
-                                None => {
-                                    println!("{}\n", ReplCommand::Dt.get_message().unwrap());
-                                    continue;
-                                }
-                            };
+                            let arg = require_arg!(parts, 1, ReplCommand::Dt);
 
-                            let mut address = DebuggerArgument::new(match parts.get(2) {
-                                Some(e) => e,
-                                None => "0",
-                            })
-                            .resolve(debugger)?;
+                            let address = DebuggerArgument::new(parts.get(2).unwrap_or(&"0"))
+                                .resolve(debugger)?;
 
                             let field_name = parts.get(3);
 
@@ -732,9 +703,9 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                                                     format!(" = {:#x}", Value(val))
                                                 }
                                                 ParsedType::Bitfield {
-                                                    underlying,
                                                     pos,
                                                     len,
+                                                    ..
                                                 } => {
                                                     let val: u64 =
                                                         mem.read(address + info.offset.into())?;
