@@ -23,7 +23,6 @@ pub struct GdbClient {
 }
 
 impl GdbClient {
-    /// Connect to a GDB stub server
     pub fn connect(addr: &str) -> Result<Self, GdbError> {
         let stream = TcpStream::connect(addr)?;
 

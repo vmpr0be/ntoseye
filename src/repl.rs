@@ -99,7 +99,7 @@ enum ReplCommand {
     )]
     Db,
 
-    #[strum(message = "Display type definition.\n(usage: dt <Name>)")]
+    #[strum(message = "Display type definition. Users may optionally supply a memory location, either as a symbol or address, and optionally provide a specific field to be printed.\n(usage: dt <Name> [VirtualAddress or Symbol] [Field])")]
     Dt,
 
     #[strum(
@@ -310,7 +310,7 @@ impl Highlighter for TrackingHighlighter {
 pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
     let message_data = debugger.get_startup_message_data()?;
 
-    let msg_v2 = format!(
+    let splash_text = format!(
         "{} {}\n{} Kernel version = {}\n{} Kernel base = {:#x}\n{} PsLoadedModuleList = {:#x}\n",
         "    ⢀⣴⠶⣶⡄⠀⠀⠀⠀".bright_blue(),
         format!(
@@ -328,7 +328,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
         message_data.loaded_module_list
     );
 
-    println!("{}", msg_v2);
+    println!("{}", splash_text);
 
     // TODO make this non-fatal
     let mut client = GdbClient::connect("127.0.0.1:1234").map_err(|e| "failed to connect to gdbstub")?;
