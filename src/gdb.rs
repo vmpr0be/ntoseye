@@ -10,6 +10,119 @@ pub enum GdbError {
     NotSupported,
 }
 
+#[derive(Debug, Clone)]
+pub struct RegisterInfo {
+    pub name: String,
+    pub offset: usize,
+    pub size: usize,
+    pub regnum: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct RegisterMap {
+    by_name: HashMap<String, RegisterInfo>,
+    ordered: Vec<RegisterInfo>,
+}
+
+impl RegisterMap {
+    // pub fn get(&self, name: &str) -> Option<&RegisterInfo> {
+    //     self.by_name.get(name)
+    // }
+
+    // pub fn get_range(&self, name: &str) -> Option<std::ops::Range<usize>> {
+    //     self.by_name.get(name).map(|r| r.offset..r.offset + r.size)
+    // }
+
+    pub fn read_u64(&self, name: &str, data: &[u8]) -> Option<u64> {
+        let info = self.by_name.get(name)?;
+        if info.offset + info.size > data.len() {
+            return None;
+        }
+        let slice = &data[info.offset..info.offset + info.size];
+
+        let mut buf = [0u8; 8];
+        let copy_len = slice.len().min(8);
+        buf[..copy_len].copy_from_slice(&slice[..copy_len]);
+        Some(u64::from_le_bytes(buf))
+    }
+
+    // pub fn iter(&self) -> impl Iterator<Item = &RegisterInfo> {
+    //     self.ordered.iter()
+    // }
+
+    // pub fn is_empty(&self) -> bool {
+    //     self.ordered.is_empty()
+    // }
+
+    fn parse_target_xml(xml: &str) -> Self {
+        let mut map = RegisterMap::default();
+        let mut current_offset: usize = 0;
+        let mut next_regnum: Option<usize> = None;
+
+        let xml = Self::strip_xml_comments(xml);
+
+        for line in xml.lines() {
+            let line = line.trim();
+            if !line.starts_with("<reg ") {
+                continue;
+            }
+
+            let name = Self::extract_attr(line, "name");
+            let bitsize = Self::extract_attr(line, "bitsize");
+            let explicit_regnum = Self::extract_attr(line, "regnum");
+
+            if let (Some(name), Some(bitsize)) = (name, bitsize) {
+                let size_bits: usize = bitsize.parse().unwrap_or(0);
+                let size_bytes = size_bits / 8;
+
+                let regnum: usize = if let Some(explicit) = explicit_regnum.and_then(|s| s.parse().ok()) {
+                    next_regnum = Some(explicit + 1);
+                    explicit
+                } else {
+                    let num = next_regnum.unwrap_or(0);
+                    next_regnum = Some(num + 1);
+                    num
+                };
+
+                let reg = RegisterInfo {
+                    name: name.to_string(),
+                    offset: current_offset,
+                    size: size_bytes,
+                    regnum,
+                };
+
+                current_offset += size_bytes;
+                map.by_name.insert(reg.name.clone(), reg.clone());
+                map.ordered.push(reg);
+            }
+        }
+
+        map
+    }
+
+    fn strip_xml_comments(xml: &str) -> String {
+        let mut result = xml.to_string();
+        while let Some(start) = result.find("<!--") {
+            if let Some(end_offset) = result[start..].find("-->") {
+                let end = start + end_offset + 3; // +3 for "-->"
+                result = format!("{}{}", &result[..start], &result[end..]);
+            } else {
+                break;
+            }
+        }
+        result
+    }
+
+    fn extract_attr<'a>(element: &'a str, attr: &str) -> Option<&'a str> {
+        let pattern = format!("{}=\"", attr);
+        let start = element.find(&pattern)?;
+        let value_start = start + pattern.len();
+        let rest = &element[value_start..];
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    }
+}
+
 impl From<io::Error> for GdbError {
     fn from(err: io::Error) -> Self {
         GdbError::Io(err)
@@ -34,7 +147,11 @@ impl GdbClient {
 
         client.force_stop_and_resync()?;
 
+        let _ = client.send_packet("qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;vContSupported+")?;
+
         let _ = client.enable_no_ack_mode();
+
+        let _ = client.send_packet("?")?;
 
         Ok(client)
     }
@@ -340,5 +457,94 @@ impl GdbClient {
         Err(GdbError::Protocol(
             "could not determine thread from stop reply".into(),
         ))
+    }
+
+    pub fn get_register_map(&mut self) -> Result<RegisterMap, GdbError> {
+        let mut xml = String::new();
+        let mut offset = 0;
+
+        loop {
+            let query = format!("qXfer:features:read:target.xml:{:x},fff", offset);
+            let response = self.send_packet(&query)?;
+
+            if response.is_empty() {
+                return Err(GdbError::NotSupported);
+            }
+
+            let (marker, data) = response.split_at(1);
+            xml.push_str(data);
+            offset += data.len();
+
+            match marker {
+                "l" => break, // last chunk
+                "m" => continue, // more data
+                _ => {
+                    return Err(GdbError::Protocol(format!(
+                        "unexpected qXfer response: {}",
+                        response
+                    )))
+                }
+            }
+        }
+
+        let full_xml = self.resolve_xml_includes(&xml)?;
+
+        Ok(RegisterMap::parse_target_xml(&full_xml))
+    }
+
+    fn resolve_xml_includes(&mut self, xml: &str) -> Result<String, GdbError> {
+        let mut result = xml.to_string();
+
+        while let Some(start) = result.find("<xi:include") {
+            let end = match result[start..].find("/>") {
+                Some(e) => start + e + 2,
+                None => break,
+            };
+
+            let element = &result[start..end];
+            let href = RegisterMap::extract_attr(element, "href");
+
+            if let Some(filename) = href {
+                // fetch the included file
+                let included_xml = self.fetch_feature_file(filename)?;
+                result = format!("{}{}{}", &result[..start], included_xml, &result[end..]);
+            } else {
+                // no href, just remove the include element
+                result = format!("{}{}", &result[..start], &result[end..]);
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn fetch_feature_file(&mut self, filename: &str) -> Result<String, GdbError> {
+        let mut xml = String::new();
+        let mut offset = 0;
+
+        loop {
+            let query = format!("qXfer:features:read:{}:{:x},fff", filename, offset);
+            let response = self.send_packet(&query)?;
+
+            if response.is_empty() {
+                return Err(GdbError::NotSupported);
+            }
+
+            let (marker, data) = response.split_at(1);
+            xml.push_str(data);
+            offset += data.len();
+
+            match marker {
+                "l" => break,
+                "m" => continue,
+                _ => {
+                    return Err(GdbError::Protocol(format!(
+                        "unexpected qXfer response for {}: {}",
+                        filename, response
+                    )))
+                }
+            }
+        }
+
+        Ok(xml)
     }
 }

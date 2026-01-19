@@ -53,7 +53,9 @@ To view command line arguments, run `ntoseye --help`. The debugger is self docum
 
 ## VM configuration
 
-Although it is not required, many features depend on `gdbstub` being enabled.
+`bcdedit /debug on` is not required within the guest.
+
+Many features depend on `gdbstub` being enabled, so its recommended that it is enabled.
 
 #### QEMU
 

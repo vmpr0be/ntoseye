@@ -1,11 +1,8 @@
-use std::{
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::fmt;
 
 use crate::{
     backend::MemoryOps,
-    guest::{Guest, WinObject},
+    guest::{Guest, ProcessInfo, WinObject},
     host::KvmHandle,
     symbols::SymbolStore,
     types::{PageTableEntry, Value, VirtAddr},
@@ -16,6 +13,7 @@ pub struct DebuggerContext {
     pub symbols: SymbolStore,
     pub guest: Guest,
     pub current_process: Option<WinObject>,
+    pub current_process_info: Option<ProcessInfo>,
 }
 
 pub struct DebuggerStartupMessage {
@@ -102,16 +100,13 @@ impl DebuggerArgument {
                 }
             }
             DebuggerArgumentValue::Symbol(sym) => {
+                let addr = context
+                    .symbols
+                    .find_symbol_across_modules(context.current_dtb(), sym)
+                    .ok_or(format!("symbol `{}` not found", sym))?;
                 if !self.deref {
-                    Ok(context
-                        .get_current_process()
-                        .symbol(&context.symbols, sym)?
-                        .address())
+                    Ok(addr)
                 } else {
-                    let addr = context
-                        .get_current_process()
-                        .symbol(&context.symbols, sym)?
-                        .address();
                     let mem = context.get_current_process().memory(&context.kvm);
                     let val: VirtAddr = mem.read(addr)?;
                     Ok(val)
@@ -127,11 +122,15 @@ impl DebuggerContext {
         let mut symbols = SymbolStore::new();
         let guest = Guest::new(&kvm, &mut symbols)?;
 
+        // load symbols for all kernel modules (ntoskrnl is already loaded, this adds others)
+        let _ = guest.load_all_kernel_module_symbols(&kvm, &mut symbols);
+
         Ok(Self {
             kvm,
             symbols,
             guest,
             current_process: None,
+            current_process_info: None,
         })
     }
 
@@ -140,6 +139,45 @@ impl DebuggerContext {
             Some(p) => p,
             None => &self.guest.ntoskrnl,
         }
+    }
+
+    pub fn attach(&mut self, pid: u64) -> Result<String, String> {
+        let processes = self.guest.enumerate_processes(&self.kvm, &self.symbols)?;
+        let process_info = processes
+            .iter()
+            .find(|p| p.pid == pid)
+            .ok_or(format!("process with PID {} not found", pid))?
+            .clone();
+
+        let name = process_info.name.clone();
+
+        let _ = self.guest.load_all_process_module_symbols(&self.kvm, &mut self.symbols, &process_info);
+
+        let winobj = self.guest.winobj_from_process_info(&self.kvm, &self.symbols, &process_info)?;
+
+        self.current_process = Some(winobj);
+        self.current_process_info = Some(process_info);
+        Ok(name)
+    }
+
+    pub fn detach(&mut self) {
+        self.current_process = None;
+        self.current_process_info = None;
+    }
+
+    pub fn current_dtb(&self) -> crate::types::Dtb {
+        match &self.current_process {
+            Some(p) => p.dtb(),
+            None => self.guest.ntoskrnl.dtb(),
+        }
+    }
+
+    pub fn current_symbol_index(&self) -> crate::symbols::SymbolIndex {
+        self.symbols.merged_symbol_index(Some(self.current_dtb()))
+    }
+
+    pub fn current_types_index(&self) -> crate::symbols::SymbolIndex {
+        self.symbols.merged_types_index(Some(self.current_dtb()))
     }
 
     pub fn get_startup_message_data(&mut self) -> Result<DebuggerStartupMessage, String> {

@@ -1,4 +1,5 @@
 use argh::FromArgs;
+use single_instance::SingleInstance;
 
 use crate::repl::start_repl;
 
@@ -63,6 +64,11 @@ fn main() -> Result<(), String> {
     if args.gdbstub_instructions {
         println!("{}", GDBSTUB_INSTRUCTIONS);
         return Ok(());
+    }
+
+    let instance = SingleInstance::new("ntoseye").unwrap();
+    if !instance.is_single() {
+        return Err("another instance of ntoseye is already running".into());
     }
 
     symbols::FORCE_DOWNLOADS

@@ -10,6 +10,7 @@ use reedline::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use strum::EnumMessage;
@@ -72,6 +73,7 @@ enum CompletionStrategy {
     None,
     Symbol,
     Type,
+    Process,
 }
 
 fn make_suggestions(
@@ -144,11 +146,40 @@ impl AddressRange {
     }
 }
 
-// TODO ps, lm, attach, br, removebr, enablebr, disablebr, continue/g
-// TODO allow for expressions to be written
-// dexp: display value from evaling expression (via type, either builtin or from pdb)
-// dtype: display type definition
-// eventually python support maybe?
+// TODO
+//
+// Memory Display:
+//   dd, dq       - Display as DWORDs/QWORDs
+//   da, du       - Display ASCII/Unicode strings
+//   dps          - Display pointers with symbol resolution
+// Memory Write:
+//   eb, ed, eq   - Edit byte/dword/qword
+//   ea, eu       - Write ASCII/Unicode string
+//   f            - Fill memory with pattern
+// Execution Control:
+//   t / si       - Single step (step into)
+//   p / ni       - Step over
+//   gu           - Go until return
+//   st           - Switch threads/VCPU
+// Breakpoints:
+//   bp           - Set software breakpoint
+//   ba           - Set hardware breakpoint (access/write)
+//   bl           - List breakpoints
+//   bc, bd, be   - Clear/disable/enable breakpoint
+//   Conditional breakpoints
+// Registers:
+//   r            - Display/modify registers
+//   context      - Auto-display regs/stack/disasm on break
+// Stack Analysis:
+//   k            - Stack backtrace
+//   kv, kp       - Backtrace with locals/params
+// Search:
+//   s            - Search memory for bytes/string/pattern
+//   x            - Search symbols by wildcard
+//   ln           - List nearest symbols to address
+// Expression Evaluation
+// Misc:
+//   vmmap        - Memory region map
 
 #[derive(Debug, Clone, Copy, PartialEq, EnumIter, Display, EnumString, EnumMessage)]
 #[strum(serialize_all = "kebab-case")]
@@ -177,6 +208,18 @@ enum ReplCommand {
     #[strum(message = "List all threads and their RIP values.\n(usage: lt)")]
     Lt,
 
+    #[strum(message = "List all running processes. Shows process name, PID, and CR3 (DirectoryTableBase).\n(usage: ps)")]
+    Ps,
+
+    #[strum(message = "List all loaded modules in the current process. For kernel context, shows kernel modules.\n(usage: lm)")]
+    Lm,
+
+    #[strum(message = "Attach to a process by PID. This sets the current process context for memory operations.\n(usage: attach <PID>)")]
+    Attach,
+
+    #[strum(message = "Detach from the current process and return to kernel context.\n(usage: detach)")]
+    Detach,
+
     #[strum(message = "Exit the application.")]
     Quit,
 }
@@ -191,13 +234,21 @@ impl ReplCommand {
             Self::Lt => CompletionStrategy::None,
             Self::Continue => CompletionStrategy::None,
             Self::Dt => CompletionStrategy::Type,
+            Self::Ps => CompletionStrategy::None,
+            Self::Lm => CompletionStrategy::None,
+            Self::Attach => CompletionStrategy::Process,
+            Self::Detach => CompletionStrategy::None,
         }
     }
 }
 
+/// Cached process info for completion (name, PID)
+type ProcessCache = Vec<(String, u64)>;
+
 struct MyCompleter {
-    symbols: Arc<SymbolIndex>,
-    types: Arc<SymbolIndex>,
+    symbols: Arc<RwLock<SymbolIndex>>,
+    types: Arc<RwLock<SymbolIndex>>,
+    processes: Arc<RwLock<ProcessCache>>,
 }
 
 impl Completer for MyCompleter {
@@ -240,7 +291,8 @@ impl Completer for MyCompleter {
                 CompletionStrategy::None => return vec![],
 
                 CompletionStrategy::Symbol => {
-                    let results = self.symbols.search(prefix, 1024);
+                    let symbols = self.symbols.read().unwrap();
+                    let results = symbols.search(prefix, 1024);
                     return make_suggestions(results, "Symbol", arg_start, prefix_offset, pos);
                 }
 
@@ -250,14 +302,37 @@ impl Completer for MyCompleter {
                         arg_count += 1;
                     }
 
-                    let (index, description) = if arg_count > 2 {
-                        (&self.symbols, "Symbol")
+                    let results = if arg_count > 2 {
+                        let symbols = self.symbols.read().unwrap();
+                        symbols.search(prefix, 1024)
                     } else {
-                        (&self.types, "Structure")
+                        let types = self.types.read().unwrap();
+                        types.search(prefix, 1024)
                     };
 
-                    let results = index.search(prefix, 1024);
+                    let description = if arg_count > 2 { "Symbol" } else { "Structure" };
                     return make_suggestions(results, description, arg_start, prefix_offset, pos);
+                }
+
+                CompletionStrategy::Process => {
+                    let processes = self.processes.read().unwrap();
+                    let prefix_lower = prefix.to_lowercase();
+                    return processes
+                        .iter()
+                        .filter(|(name, pid)| {
+                            name.to_lowercase().contains(&prefix_lower)
+                                || pid.to_string().starts_with(prefix)
+                        })
+                        .map(|(name, pid)| Suggestion {
+                            value: pid.to_string(),
+                            description: Some(format!("{} (PID {})", name, pid)),
+                            style: None,
+                            extra: None,
+                            match_indices: None,
+                            span: Span::new(arg_start + prefix_offset, pos),
+                            append_whitespace: true,
+                        })
+                        .collect();
                 }
             }
         }
@@ -352,6 +427,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
     // TODO make this non-fatal
     let mut client = GdbClient::connect("127.0.0.1:1234").map_err(|_| "failed to connect to gdbstub")?;
 
+    let register_map = client.get_register_map().map_err(|e| format!("failed to get register map: {:?}", e))?;
+
     let min_completion_width: u16 = 0;
     let max_completion_width: u16 = 50;
     let max_completion_height: u16 = 12;
@@ -405,15 +482,20 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
 
     let edit_mode = Box::new(Emacs::new(keybindings));
 
+    let shared_symbols = Arc::new(RwLock::new(debugger.current_symbol_index()));
+    let shared_types = Arc::new(RwLock::new(debugger.current_types_index()));
+
+    let initial_processes = debugger
+        .guest
+        .enumerate_processes(&debugger.kvm, &debugger.symbols)
+        .map(|procs| procs.into_iter().map(|p| (p.name, p.pid)).collect())
+        .unwrap_or_default();   
+    let shared_processes: Arc<RwLock<ProcessCache>> = Arc::new(RwLock::new(initial_processes));
+
     let completor = Box::new(MyCompleter {
-        symbols: debugger
-            .symbols
-            .symbol_index(debugger.guest.ntoskrnl.guid.unwrap())
-            .unwrap(),
-        types: debugger
-            .symbols
-            .types_index(debugger.guest.ntoskrnl.guid.unwrap())
-            .unwrap(),
+        symbols: Arc::clone(&shared_symbols),
+        types: Arc::clone(&shared_types),
+        processes: Arc::clone(&shared_processes),
     });
 
     let had_content = Arc::new(AtomicBool::new(false));
@@ -551,9 +633,28 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
 
                                 if instruction.is_ip_rel_memory_operand() {
                                     let target_address = instruction.ip_rel_memory_address();
+                                    let sym = debugger
+                                        .guest
+                                        .ntoskrnl
+                                        .closest_symbol(&debugger.symbols, VirtAddr(target_address))
+                                        .map(|(s, o)| format!("{}+{:#x}", s, o))
+                                        .unwrap_or_else(|_| format!("{:#X}", target_address));
                                     print!(
                                         "{}",
-                                        format!(" ; 0x{:X}", target_address).bright_black()
+                                        format!(" ; {}", sym).bright_black()
+                                    );
+                                }
+                                else if instruction.is_call_near() || instruction.is_jmp_near() || instruction.is_jcc_near() {
+                                    let target_address = instruction.near_branch_target();
+                                    let sym = debugger
+                                        .guest
+                                        .ntoskrnl
+                                        .closest_symbol(&debugger.symbols, VirtAddr(target_address))
+                                        .map(|(s, o)| format!("{}+{:#x}", s, o))
+                                        .unwrap_or_else(|_| format!("{:#X}", target_address));
+                                    print!(
+                                        "{}",
+                                        format!(" ; {}", sym).bright_black()
                                     );
                                 }
 
@@ -587,30 +688,61 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                                 .map_err(|e| format!("{:?}", e))?;
                             let threads =
                                 client.get_thread_list().map_err(|e| format!("{:?}", e))?;
+                            
+                            let processes = debugger
+                                .guest
+                                .enumerate_processes(&debugger.kvm, &debugger.symbols)
+                                .unwrap_or_default();
+                            let kernel_dtb = debugger.guest.ntoskrnl.dtb();
 
-                            let mut thread_data: Vec<(String, String, String)> = Vec::new();
+                            let mut thread_data: Vec<(String, String, String, String)> = Vec::new();
 
                             for thread in &threads {
                                 client
                                     .set_current_thread(thread)
                                     .map_err(|e| format!("{:?}", e))?;
-                                // let rip =
-                                //   client.read_register_u64(16).map_err(|e| format!("{:?}", e))?;
-                                let registers = vec_u8_to_u64_le(
-                                    client.read_registers().map_err(|e| format!("{:?}", e))?,
-                                );
-                                let rip = registers[16];
-                                // let cr3 = u64::from_le_bytes(registers[316..316+8].try_into().unwrap());
 
-                                let attempt = debugger.get_current_process().closest_symbol(&debugger.symbols, VirtAddr(rip));
+                                let regs = client.read_registers().map_err(|e| format!("{:?}", e))?;
+                                let rip = register_map.read_u64("rip", &regs)
+                                    .ok_or("failed to read rip from register data")?;
+                                let cr3 = register_map.read_u64("cr3", &regs)
+                                    .ok_or("failed to read cr3 from register data")?;
 
-                                let symbol = match attempt {
-                                    Ok((symbol, offset)) => format!("{}+{:#x}", symbol, offset),
-                                    Err(e) => e
+                                let cr3_masked = cr3 & 0x000F_FFFF_FFFF_F000;
+                                let kernel_dtb_masked = kernel_dtb.0.0 & 0x000F_FFFF_FFFF_F000;
+
+                                let (context, symbol) = if cr3_masked == kernel_dtb_masked {
+                                    let sym = debugger
+                                        .guest
+                                        .ntoskrnl
+                                        .closest_symbol(&debugger.symbols, VirtAddr(rip))
+                                        .map(|(s, o)| format!("{}+{:#x}", s, o))
+                                        .unwrap_or_else(|e| e);
+                                    ("kernel".to_string(), sym)
+                                } else {
+                                    match processes.iter().find(|p| (p.dtb.0.0 & 0x000F_FFFF_FFFF_F000) == cr3_masked) {
+                                        Some(proc) => {
+                                            let sym = debugger
+                                                .symbols
+                                                .find_closest_symbol_for_address(proc.dtb, VirtAddr(rip))
+                                                .map(|(module, sym, offset)| {
+                                                    if offset == 0 {
+                                                        format!("{}!{}", module, sym)
+                                                    } else {
+                                                        format!("{}!{}+{:#x}", module, sym, offset)
+                                                    }
+                                                })
+                                                .unwrap_or_else(|| format!("{:#x}", rip));
+                                            (proc.name.clone(), sym)
+                                        }
+                                        None => {
+                                            ("unknown".to_string(), format!("{:#x}", rip))
+                                        }
+                                    }
                                 };
 
                                 thread_data
-                                    .push((thread.clone(), format!("{:#018x}", VirtAddr(rip)), symbol));
+                                    .push((thread.clone(), format!("{:#018x}", VirtAddr(rip)), context, symbol));
                             }
 
                             client
@@ -618,9 +750,14 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                                 .map_err(|e| format!("{:?}", e))?;
 
                             let mut builder = Builder::default();
-                            builder.push_record(vec!["Thread  ", &format!("{:-20}", "RIP"), "Symbol"]);
-                            for (tid, rip, sym) in thread_data {
-                                builder.push_record(vec![tid, rip, sym]);
+                            builder.push_record(vec!["Thread", "RIP", "Context", "Symbol"]);
+                            for (tid, rip, ctx, sym) in thread_data {
+                                builder.push_record(vec![
+                                    format!("{}  ", tid),
+                                    format!("{}  ", rip),
+                                    format!("{}  ", ctx),
+                                    sym,
+                                ]);
                             }
 
                             pb.finish_and_clear();
@@ -648,9 +785,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
 
                             let field_name = parts.get(3);
 
-                            let process = debugger.get_current_process();
-                            match process.class(&debugger.symbols, arg) {
-                                Ok(type_info) => {
+                            match debugger.symbols.find_type_across_modules(debugger.current_dtb(), arg) {
+                                Some(type_info) => {
                                     let mut builder = Builder::default();
                                     builder.push_record(vec![format!(
                                         "{} ({} bytes)",
@@ -746,9 +882,111 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                                         .with(Padding::zero());
                                     println!("{}\n", table);
                                 }
-                                Err(e) => {
-                                    error!("failed to get type information: {}\n", e);
+                                None => {
+                                    error!("failed to get type information: type `{}` not found\n", arg);
                                 }
+                            }
+                        }
+                        Ok(ReplCommand::Ps) => {
+                            match debugger.guest.enumerate_processes(&debugger.kvm, &debugger.symbols) {
+                                Ok(processes) => {
+                                    *shared_processes.write().unwrap() = processes
+                                        .iter()
+                                        .map(|p| (p.name.clone(), p.pid))
+                                        .collect();
+
+                                    let mut builder = Builder::default();
+                                    builder.push_record(vec![
+                                        "Name".to_string(),
+                                        "PID".to_string(),
+                                        "CR3".to_string(),
+                                    ]);
+
+                                    for proc in processes {
+                                        builder.push_record(vec![
+                                            format!("{}  ", proc.name),
+                                            format!("{}  ", Value(proc.pid)),
+                                            format!("{:#018x}", VirtAddr(proc.dtb.0.0)), // TODO technically is phys addr..
+                                        ]);
+                                    }
+
+                                    let mut table = builder.build();
+                                    table
+                                        .with(tabled::settings::Style::empty())
+                                        .with(Padding::zero());
+                                    println!("{}\n", table);
+                                }
+                                Err(e) => {
+                                    error!("failed to enumerate processes: {}", e);
+                                }
+                            }
+                        }
+                        Ok(ReplCommand::Lm) => {
+                            let result = if let Some(process_info) = &debugger.current_process_info {
+                                debugger.guest.get_process_modules(&debugger.kvm, &debugger.symbols, process_info)
+                            } else {
+                                debugger.guest.get_kernel_modules(&debugger.kvm, &debugger.symbols)
+                            };
+
+                            match result {
+                                Ok(modules) => {
+                                    let mut builder = Builder::default();
+                                    builder.push_record(vec![
+                                        "Start".to_string(),
+                                        "End".to_string(),
+                                        "Module".to_string(),
+                                        "Image".to_string(),
+                                    ]);
+
+                                    for module in modules {
+                                        let end_address = module.base_address.0 + module.size as u64;
+                                        builder.push_record(vec![
+                                            format!("{:#018x}  ", module.base_address),
+                                            format!("{:#018x}  ", VirtAddr(end_address)),
+                                            format!("{}  ", module.short_name),
+                                            module.name,
+                                        ]);
+                                    }
+
+                                    let mut table = builder.build();
+                                    table
+                                        .with(tabled::settings::Style::empty())
+                                        .with(Padding::zero());
+                                    println!("{}\n", table);
+                                }
+                                Err(e) => {
+                                    error!("failed to list modules: {}", e);
+                                }
+                            }
+                        }
+                        Ok(ReplCommand::Attach) => {
+                            let pid_str = require_arg!(parts, 1, ReplCommand::Attach);
+                            match pid_str.parse::<u64>() {
+                                Ok(pid) => {
+                                    match debugger.attach(pid) {
+                                        Ok(name) => {
+                                            *shared_symbols.write().unwrap() = debugger.current_symbol_index();
+                                            *shared_types.write().unwrap() = debugger.current_types_index();
+                                            println!("attached to {} (PID {})\n", name, pid);
+                                        }
+                                        Err(e) => {
+                                            error!("failed to attach: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    error!("invalid PID: {}", pid_str);
+                                }
+                            }
+                        }
+                        Ok(ReplCommand::Detach) => {
+                            if debugger.current_process.is_none() {
+                                error!("not attached to any process");
+                            } else {
+                                debugger.detach();
+                                *shared_symbols.write().unwrap() = debugger.current_symbol_index();
+                                *shared_types.write().unwrap() = debugger.current_types_index();
+                                println!("detached, now in kernel context\n");
                             }
                         }
                         Err(_) => {
@@ -778,6 +1016,10 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                 }
             }
         }
+    }
+
+    if !client.is_running {
+        let _ = client.continue_execution();
     }
 
     Ok(())

@@ -1,6 +1,6 @@
 [package]
 name = "ntoseye"
-version = "0.3.0"
+version = "0.1.0"
 edition = "2024"
 authors = [ "dmaivel" ]
 description = "Windows kernel debugger for Linux hosts running Windows under KVM/QEMU"
@@ -24,6 +24,7 @@ pdb = "0.8.0"
 pelite = "0.10.0"
 reedline = "0.44.0"
 reqwest = { version = "0.12.28", features = [ "blocking" ] }
+single-instance = "0.3.3"
 strum = "0.27.2"
 strum_macros = "0.27.2"
 tabled = { version = "0.20.0", features = [ "ansi" ] }

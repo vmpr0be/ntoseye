@@ -5,9 +5,48 @@ use crate::{
     symbols::{SymbolStore, TypeInfo},
     types::*,
 };
+use indicatif::{ProgressBar, ProgressStyle};
 use zerocopy::{FromBytes, IntoBytes};
 use pelite::pe64::{Pe, PeView};
 use anyhow::Result;
+
+/// used for enumeration without loading full WinObject
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    pub pid: u64,
+    pub name: String,
+    pub dtb: Dtb,
+    pub eprocess_va: VirtAddr,
+}
+
+/// module metadata from PEB LDR list
+#[derive(Debug, Clone)]
+pub struct ModuleInfo {
+    pub name: String,
+    pub short_name: String,
+    pub base_address: VirtAddr,
+    pub size: u32,
+}
+
+impl ModuleInfo {
+    pub fn new(name: String, base_address: VirtAddr, size: u32) -> Self {
+        let short_name = Self::derive_short_name(&name);
+        Self { name, short_name, base_address, size }
+    }
+
+    pub fn derive_short_name(name: &str) -> String {
+        let filename = name.rsplit(['\\', '/']).next().unwrap_or(name);
+        let without_ext = filename.rsplit_once('.')
+            .map(|(base, _)| base)
+            .unwrap_or(filename);
+
+        let lowered = without_ext.to_lowercase();
+        match lowered.as_str() {
+            "ntoskrnl" | "ntkrnlmp" | "ntkrnlpa" | "ntkrpamp" => "nt".to_string(),
+            _ => lowered,
+        }
+    }
+}
 
 pub fn read_pe_image<'a, B: MemoryOps<PhysAddr>>(
     base_address: VirtAddr,
@@ -17,7 +56,7 @@ pub fn read_pe_image<'a, B: MemoryOps<PhysAddr>>(
 
     memory.read_bytes(base_address, &mut header_buf)?;
 
-    let view = PeView::from_bytes(&header_buf).map_err(|e| format!("Header parse error: {}", e))?;
+    let view = PeView::from_bytes(&header_buf).map_err(|e| format!("header parse error: {}", e))?;
     let optional_header = view.optional_header();
     let sections = view.section_headers();
 
@@ -44,13 +83,6 @@ pub fn read_pe_image<'a, B: MemoryOps<PhysAddr>>(
     Ok(image_buffer)
 }
 
-pub enum WinObjectKind {
-    Ntoskrnl,
-    KernelModule,
-    Process,
-    ProcessModule,
-}
-
 pub struct SymbolRef<'a> {
     obj: &'a WinObject,
     rva: u32,
@@ -73,17 +105,15 @@ impl SymbolRef<'_> {
 pub struct WinObject {
     pub base_address: VirtAddr,
     dtb: Dtb,
-    kind: WinObjectKind,
     binary_snapshot: Vec<u8>,
     pub guid: Option<u128>,
 }
 
 impl WinObject {
-    pub fn new(dtb: Dtb, base_address: VirtAddr, kind: WinObjectKind) -> Self {
+    pub fn new(dtb: Dtb, base_address: VirtAddr) -> Self {
         Self {
             base_address,
             dtb,
-            kind,
             binary_snapshot: Vec::new(),
             guid: None,
         }
@@ -96,6 +126,10 @@ impl WinObject {
     ) -> Result<Self, String> {
         self.guid = Some(symbols.load_from_binary(kvm, &mut self)?);
         Ok(self)
+    }
+
+    pub fn dtb(&self) -> Dtb {
+        self.dtb
     }
 
     pub fn address_of(&self, rva: impl Into<u64>) -> VirtAddr {
@@ -311,7 +345,6 @@ fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject, String> {
                             return Ok(WinObject::new(
                                 Dtb(PhysAddr(pa_dtb)),
                                 VirtAddr(kernel_base + p as u64),
-                                WinObjectKind::Ntoskrnl,
                             ));
                         }
                     }
@@ -331,5 +364,639 @@ impl Guest {
     pub fn new(kvm: &KvmHandle, symbols: &mut SymbolStore) -> Result<Self, String> {
         let ntoskrnl = get_ntoskrnl_winobj(kvm)?.load_symbols(kvm, symbols)?;
         Ok(Self { ntoskrnl })
+    }
+
+    pub fn enumerate_processes(
+        &self,
+        kvm: &KvmHandle,
+        symbols: &SymbolStore,
+    ) -> Result<Vec<ProcessInfo>, String> {
+        let memory = self.ntoskrnl.memory(kvm);
+
+        let eprocess_info = self
+            .ntoskrnl
+            .class(symbols, "_EPROCESS")
+            .map_err(|_| "failed to get _EPROCESS type info")?;
+
+        let active_process_links_offset = eprocess_info
+            .fields
+            .get("ActiveProcessLinks")
+            .ok_or("ActiveProcessLinks field not found")?
+            .offset as u64;
+
+        let pcb_offset = eprocess_info
+            .fields
+            .get("Pcb")
+            .ok_or("Pcb field not found")?
+            .offset as u64;
+
+        let kprocess_info = self
+            .ntoskrnl
+            .class(symbols, "_KPROCESS")
+            .map_err(|_| "failed to get _KPROCESS type info")?;
+
+        let dir_table_base_offset = pcb_offset
+            + kprocess_info
+                .fields
+                .get("DirectoryTableBase")
+                .ok_or("DirectoryTableBase field not found in _KPROCESS")?
+                .offset as u64;
+
+        let unique_process_id_offset = eprocess_info
+            .fields
+            .get("UniqueProcessId")
+            .ok_or("UniqueProcessId field not found")?
+            .offset as u64;
+
+        let image_filename_offset = eprocess_info
+            .fields
+            .get("ImageFileName")
+            .ok_or("ImageFileName field not found")?
+            .offset as u64;
+
+        let peb_offset = eprocess_info
+            .fields
+            .get("Peb")
+            .ok_or("Peb field not found")?
+            .offset as u64;
+
+        let peb_info = self
+            .ntoskrnl
+            .class(symbols, "_PEB")
+            .map_err(|_| "failed to get _PEB type info")?;
+
+        let ldr_offset = peb_info
+            .fields
+            .get("Ldr")
+            .ok_or("Ldr field not found")?
+            .offset as u64;
+
+        let image_base_address_offset = peb_info
+            .fields
+            .get("ImageBaseAddress")
+            .ok_or("ImageBaseAddress field not found")?
+            .offset as u64;
+
+        let ldr_info = self
+            .ntoskrnl
+            .class(symbols, "_PEB_LDR_DATA")
+            .map_err(|_| "failed to get _PEB_LDR_DATA type info")?;
+
+        let in_load_order_offset = ldr_info
+            .fields
+            .get("InLoadOrderModuleList")
+            .ok_or("InLoadOrderModuleList field not found")?
+            .offset as u64;
+
+        let ldr_entry_info = self
+            .ntoskrnl
+            .class(symbols, "_LDR_DATA_TABLE_ENTRY")
+            .map_err(|_| "failed to get _LDR_DATA_TABLE_ENTRY type info")?;
+
+        let dll_base_offset = ldr_entry_info
+            .fields
+            .get("DllBase")
+            .ok_or("DllBase field not found")?
+            .offset as u64;
+
+        let base_dll_name_offset = ldr_entry_info
+            .fields
+            .get("BaseDllName")
+            .ok_or("BaseDllName field not found")?
+            .offset as u64;
+
+        let ps_initial_system_process: VirtAddr = self
+            .ntoskrnl
+            .symbol(symbols, "PsInitialSystemProcess")?
+            .read(kvm)?;
+
+        let mut processes = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+
+        let mut current_eprocess = ps_initial_system_process;
+
+        loop {
+            if current_eprocess.0 == 0 || visited.contains(&current_eprocess.0) {
+                break;
+            }
+            visited.insert(current_eprocess.0);
+
+            let pid: u64 = memory.read(current_eprocess + unique_process_id_offset)?;
+            let dtb: u64 = memory.read(current_eprocess + dir_table_base_offset)?;
+
+            if dtb == 0 {
+                break;
+            }
+
+            let dtb = Dtb(PhysAddr(dtb));
+
+            let name = self
+                .get_full_process_name(
+                    kvm,
+                    current_eprocess,
+                    dtb,
+                    peb_offset,
+                    ldr_offset,
+                    image_base_address_offset,
+                    in_load_order_offset,
+                    dll_base_offset,
+                    base_dll_name_offset,
+                )
+                .unwrap_or_else(|_| {
+                    let mut name_buf = [0u8; 15];
+                    if memory
+                        .read_bytes(current_eprocess + image_filename_offset, &mut name_buf)
+                        .is_ok()
+                    {
+                        String::from_utf8_lossy(
+                            &name_buf[..name_buf.iter().position(|&c| c == 0).unwrap_or(15)],
+                        )
+                        .to_string()
+                    } else {
+                        "<unknown>".to_string()
+                    }
+                });
+
+            processes.push(ProcessInfo {
+                pid,
+                name,
+                dtb,
+                eprocess_va: current_eprocess,
+            });
+
+            let flink: VirtAddr = memory.read(current_eprocess + active_process_links_offset)?;
+            if flink.0 == 0 {
+                break;
+            }
+
+            current_eprocess = flink - active_process_links_offset;
+            if current_eprocess == ps_initial_system_process {
+                break;
+            }
+        }
+
+        Ok(processes)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn get_full_process_name(
+        &self,
+        kvm: &KvmHandle,
+        eprocess_va: VirtAddr,
+        dtb: Dtb,
+        peb_offset: u64,
+        ldr_offset: u64,
+        image_base_address_offset: u64,
+        in_load_order_offset: u64,
+        dll_base_offset: u64,
+        base_dll_name_offset: u64,
+    ) -> Result<String, String> {
+        let kernel_memory = self.ntoskrnl.memory(kvm);
+        let process_memory = memory::AddressSpace::new(kvm, dtb);
+
+        let peb_addr: VirtAddr = kernel_memory.read(eprocess_va + peb_offset)?;
+        if peb_addr.0 == 0 {
+            return Err("no PEB".into());
+        }
+
+        let image_base: VirtAddr = process_memory.read(peb_addr + image_base_address_offset)?;
+        if image_base.0 == 0 {
+            return Err("no ImageBaseAddress".into());
+        }
+
+        let ldr_addr: VirtAddr = process_memory.read(peb_addr + ldr_offset)?;
+        if ldr_addr.0 == 0 {
+            return Err("no Ldr".into());
+        }
+
+        let list_head: VirtAddr = process_memory.read(ldr_addr + in_load_order_offset)?;
+        let list_end = ldr_addr + in_load_order_offset;
+
+        let mut current = list_head;
+        let mut iterations = 0;
+        const MAX_ITERATIONS: usize = 1000;
+
+        while current.0 != 0 && current != list_end && iterations < MAX_ITERATIONS {
+            iterations += 1;
+
+            let entry_base = current;
+            let dll_base: VirtAddr = process_memory.read(entry_base + dll_base_offset)?;
+
+            if dll_base == image_base {
+                // Read UNICODE_STRING for BaseDllName
+                let name_length: u16 = process_memory.read(entry_base + base_dll_name_offset)?;
+                let name_buffer: VirtAddr =
+                    process_memory.read(entry_base + base_dll_name_offset + 8)?;
+
+                if name_length > 0 && name_buffer.0 != 0 && name_length < 520 {
+                    let mut name_buf = vec![0u8; name_length as usize];
+                    process_memory.read_bytes(name_buffer, &mut name_buf)?;
+
+                    // Convert UTF-16LE to String
+                    let u16_chars: Vec<u16> = name_buf
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    return Ok(String::from_utf16_lossy(&u16_chars));
+                }
+            }
+
+            let next: VirtAddr = process_memory.read(current)?;
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+
+        Err("main module not found in LDR list".into())
+    }
+
+    pub fn winobj_from_process_info(
+        &self,
+        kvm: &KvmHandle,
+        symbols: &SymbolStore,
+        info: &ProcessInfo,
+    ) -> Result<WinObject, String> {
+        let memory = memory::AddressSpace::new(kvm, info.dtb);
+
+        let eprocess_info = self
+            .ntoskrnl
+            .class(symbols, "_EPROCESS")
+            .map_err(|_| "failed to get _EPROCESS type info")?;
+
+        let peb_offset = eprocess_info
+            .fields
+            .get("Peb")
+            .ok_or("Peb field not found")?
+            .offset as u64;
+
+        let peb_addr: VirtAddr = self.ntoskrnl.memory(kvm).read(info.eprocess_va + peb_offset)?;
+
+        if peb_addr.0 == 0 {
+            return Err("process has no PEB (kernel process?)".into());
+        }
+
+        let peb_info = self
+            .ntoskrnl
+            .class(symbols, "_PEB")
+            .map_err(|_| "failed to get _PEB type info")?;
+
+        let image_base_offset = peb_info
+            .fields
+            .get("ImageBaseAddress")
+            .ok_or("ImageBaseAddress field not found")?
+            .offset as u64;
+
+        let base_address: VirtAddr = memory.read(peb_addr + image_base_offset)?;
+
+        Ok(WinObject::new(info.dtb, base_address))
+    }
+
+    pub fn get_process_modules(
+        &self,
+        kvm: &KvmHandle,
+        symbols: &SymbolStore,
+        info: &ProcessInfo,
+    ) -> Result<Vec<ModuleInfo>, String> {
+        let kernel_memory = self.ntoskrnl.memory(kvm);
+        let process_memory = memory::AddressSpace::new(kvm, info.dtb);
+
+        // Get PEB offset from _EPROCESS
+        let eprocess_info = self
+            .ntoskrnl
+            .class(symbols, "_EPROCESS")
+            .map_err(|_| "failed to get _EPROCESS type info")?;
+
+        let peb_offset = eprocess_info
+            .fields
+            .get("Peb")
+            .ok_or("Peb field not found")?
+            .offset as u64;
+
+        let peb_addr: VirtAddr = kernel_memory.read(info.eprocess_va + peb_offset)?;
+        if peb_addr.0 == 0 {
+            return Err("process has no PEB (kernel process?)".into());
+        }
+
+        let peb_info = self
+            .ntoskrnl
+            .class(symbols, "_PEB")
+            .map_err(|_| "failed to get _PEB type info")?;
+
+        let ldr_offset = peb_info
+            .fields
+            .get("Ldr")
+            .ok_or("Ldr field not found")?
+            .offset as u64;
+
+        let ldr_addr: VirtAddr = process_memory.read(peb_addr + ldr_offset)?;
+
+        if ldr_addr.0 == 0 {
+            return Ok(Vec::new());
+        }
+
+        let ldr_info = self
+            .ntoskrnl
+            .class(symbols, "_PEB_LDR_DATA")
+            .map_err(|_| "failed to get _PEB_LDR_DATA type info")?;
+
+        let in_load_order_offset = ldr_info
+            .fields
+            .get("InLoadOrderModuleList")
+            .ok_or("InLoadOrderModuleList field not found")?
+            .offset as u64;
+
+        let ldr_entry_info = self
+            .ntoskrnl
+            .class(symbols, "_LDR_DATA_TABLE_ENTRY")
+            .map_err(|_| "failed to get _LDR_DATA_TABLE_ENTRY type info")?;
+
+        let dll_base_offset = ldr_entry_info
+            .fields
+            .get("DllBase")
+            .ok_or("DllBase field not found")?
+            .offset as u64;
+
+        let size_of_image_offset = ldr_entry_info
+            .fields
+            .get("SizeOfImage")
+            .ok_or("SizeOfImage field not found")?
+            .offset as u64;
+
+        let base_dll_name_offset = ldr_entry_info
+            .fields
+            .get("BaseDllName")
+            .ok_or("BaseDllName field not found")?
+            .offset as u64;
+
+        let list_head: VirtAddr = process_memory.read(ldr_addr + in_load_order_offset)?;
+        let list_end = ldr_addr + in_load_order_offset;
+
+        let mut modules = Vec::new();
+        let mut current = list_head;
+
+        loop {
+            if current.0 == 0 || current == list_end {
+                break;
+            }
+
+            // current points to InLoadOrderLinks, which is at offset 0 in LDR_DATA_TABLE_ENTRY
+            let entry_base = current;
+
+            let dll_base: VirtAddr = process_memory.read(entry_base + dll_base_offset)?;
+            let size_of_image: u32 = process_memory.read(entry_base + size_of_image_offset)?;
+
+            // Read UNICODE_STRING for BaseDllName
+            let name_length: u16 = process_memory.read(entry_base + base_dll_name_offset)?;
+            let name_buffer: VirtAddr =
+                process_memory.read(entry_base + base_dll_name_offset + 8)?;
+
+            let name = if name_length > 0 && name_buffer.0 != 0 {
+                let mut name_buf = vec![0u8; name_length as usize];
+                if process_memory.read_bytes(name_buffer, &mut name_buf).is_ok() {
+                    // Convert UTF-16LE to String
+                    let u16_chars: Vec<u16> = name_buf
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    String::from_utf16_lossy(&u16_chars)
+                } else {
+                    "<unknown>".to_string()
+                }
+            } else {
+                "<unknown>".to_string()
+            };
+
+            if dll_base.0 != 0 {
+                modules.push(ModuleInfo::new(name, dll_base, size_of_image));
+            }
+
+            let next: VirtAddr = process_memory.read(current)?;
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+
+        Ok(modules)
+    }
+
+    pub fn get_kernel_modules(
+        &self,
+        kvm: &KvmHandle,
+        symbols: &SymbolStore,
+    ) -> Result<Vec<ModuleInfo>, String> {
+        let memory = self.ntoskrnl.memory(kvm);
+
+        let ps_loaded_module_list = self
+            .ntoskrnl
+            .symbol(symbols, "PsLoadedModuleList")?
+            .address();
+
+        // Get _KLDR_DATA_TABLE_ENTRY field offsets (kernel uses KLDR variant)
+        // Fall back to _LDR_DATA_TABLE_ENTRY if KLDR not found
+        let ldr_entry_info = self
+            .ntoskrnl
+            .class(symbols, "_KLDR_DATA_TABLE_ENTRY")
+            .or_else(|_| self.ntoskrnl.class(symbols, "_LDR_DATA_TABLE_ENTRY"))
+            .map_err(|_| "failed to get LDR entry type info")?;
+
+        let dll_base_offset = ldr_entry_info
+            .fields
+            .get("DllBase")
+            .ok_or("DllBase field not found")?
+            .offset as u64;
+
+        let size_of_image_offset = ldr_entry_info
+            .fields
+            .get("SizeOfImage")
+            .ok_or("SizeOfImage field not found")?
+            .offset as u64;
+
+        let base_dll_name_offset = ldr_entry_info
+            .fields
+            .get("BaseDllName")
+            .ok_or("BaseDllName field not found")?
+            .offset as u64;
+
+        let list_head: VirtAddr = memory.read(ps_loaded_module_list)?;
+        let list_end = ps_loaded_module_list;
+
+        let mut modules = Vec::new();
+        let mut current = list_head;
+
+        loop {
+            if current.0 == 0 || current == list_end {
+                break;
+            }
+
+            // current points to InLoadOrderLinks, which is at offset 0
+            let entry_base = current;
+            let dll_base: VirtAddr = memory.read(entry_base + dll_base_offset)?;
+            let size_of_image: u32 = memory.read(entry_base + size_of_image_offset)?;
+
+            // Read UNICODE_STRING for BaseDllName
+            let name_length: u16 = memory.read(entry_base + base_dll_name_offset)?;
+            let name_buffer: VirtAddr = memory.read(entry_base + base_dll_name_offset + 8)?;
+
+            let name = if name_length > 0 && name_buffer.0 != 0 {
+                let mut name_buf = vec![0u8; name_length as usize];
+                if memory.read_bytes(name_buffer, &mut name_buf).is_ok() {
+                    let u16_chars: Vec<u16> = name_buf
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    String::from_utf16_lossy(&u16_chars)
+                } else {
+                    "<unknown>".to_string()
+                }
+            } else {
+                "<unknown>".to_string()
+            };
+
+            if dll_base.0 != 0 {
+                modules.push(ModuleInfo::new(name, dll_base, size_of_image));
+            }
+
+            let next: VirtAddr = memory.read(current)?;
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+
+        Ok(modules)
+    }
+
+    fn is_session_space(addr: VirtAddr) -> bool {
+        let prefix = addr.0 >> 44;
+        prefix == 0xFFFF8 || prefix == 0xFFFF9 || prefix == 0xFFFFA
+    }
+
+    pub fn load_all_kernel_module_symbols(
+        &self,
+        kvm: &KvmHandle,
+        symbols: &mut SymbolStore,
+    ) -> Result<usize, String> {
+        use crate::symbols::{DownloadJob, SymbolStore, download_pdbs_parallel};
+
+        let modules = self.get_kernel_modules(kvm, symbols)?;
+        let dtb = self.ntoskrnl.dtb;
+
+        let mut jobs_with_info: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
+        let mut already_loaded: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
+        let mut loaded = 0;
+
+        for module in &modules {
+            if Self::is_session_space(module.base_address) {
+                continue;
+            }
+
+            if let Ok((job, guid)) = SymbolStore::extract_download_job(
+                kvm,
+                dtb,
+                module.base_address,
+                &module.name,
+            ) {
+                if symbols.has_guid(guid) {
+                    already_loaded.push((job, guid, module.clone()));
+                    continue;
+                }
+                jobs_with_info.push((job, guid, module.clone()));
+            }
+        }
+
+        let jobs: Vec<DownloadJob> = jobs_with_info.iter().map(|(j, _, _)| j.clone()).collect();
+        let _ = download_pdbs_parallel(jobs);
+
+        let total = already_loaded.len() + jobs_with_info.len();
+        if total > 0 {
+            let pb = ProgressBar::new(total as u64);
+            pb.set_style(
+                ProgressStyle::with_template("Indexing [{bar:40}] {pos}/{len}")
+                    .unwrap()
+                    .progress_chars("#-"),
+            );
+
+            for (job, guid, module) in already_loaded.iter().chain(jobs_with_info.iter()) {
+                if symbols.load_downloaded_pdb(
+                    job,
+                    *guid,
+                    &module.name,
+                    module.base_address,
+                    module.size,
+                    dtb,
+                ).is_ok() {
+                    loaded += 1;
+                }
+                pb.inc(1);
+            }
+
+            pb.finish_and_clear();
+        }
+
+        Ok(loaded)
+    }
+
+    pub fn load_all_process_module_symbols(
+        &self,
+        kvm: &KvmHandle,
+        symbols: &mut SymbolStore,
+        info: &ProcessInfo,
+    ) -> Result<usize, String> {
+        use crate::symbols::{DownloadJob, SymbolStore, download_pdbs_parallel};
+
+        let modules = self.get_process_modules(kvm, symbols, info)?;
+        let dtb = info.dtb;
+
+        let mut jobs_with_info: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
+        let mut already_loaded: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
+        let mut loaded = 0;
+
+        for module in &modules {
+            if let Ok((job, guid)) = SymbolStore::extract_download_job(
+                kvm,
+                dtb,
+                module.base_address,
+                &module.name,
+            ) {
+                if symbols.has_guid(guid) {
+                    already_loaded.push((job, guid, module.clone()));
+                    continue;
+                }
+                jobs_with_info.push((job, guid, module.clone()));
+            }
+        }
+
+        let jobs: Vec<DownloadJob> = jobs_with_info.iter().map(|(j, _, _)| j.clone()).collect();
+        let _ = download_pdbs_parallel(jobs);
+
+        let total = already_loaded.len() + jobs_with_info.len();
+        if total > 0 {
+            let pb = ProgressBar::new(total as u64);
+            pb.set_style(
+                ProgressStyle::with_template("Indexing [{bar:40}] {pos}/{len}")
+                    .unwrap()
+                    .progress_chars("#-"),
+            );
+
+            for (job, guid, module) in already_loaded.iter().chain(jobs_with_info.iter()) {
+                if symbols.load_downloaded_pdb(
+                    job,
+                    *guid,
+                    &module.name,
+                    module.base_address,
+                    module.size,
+                    dtb,
+                ).is_ok() {
+                    loaded += 1;
+                }
+                pb.inc(1);
+            }
+
+            pb.finish_and_clear();
+        }
+
+        Ok(loaded)
     }
 }
