@@ -29,7 +29,7 @@ use std::{borrow::Cow};
 
 use crate::backend::MemoryOps;
 use crate::debugger::{DebuggerArgument, DebuggerContext};
-use crate::gdb::GdbClient;
+use crate::gdb::{GdbClient, RegisterMap};
 use crate::symbols::{ParsedType, SymbolIndex};
 use crate::types::{Value, VirtAddr};
 
@@ -74,6 +74,7 @@ enum CompletionStrategy {
     Symbol,
     Type,
     Process,
+    Thread,
 }
 
 fn make_suggestions(
@@ -220,6 +221,12 @@ enum ReplCommand {
     #[strum(message = "Detach from the current process and return to kernel context.\n(usage: detach)")]
     Detach,
 
+    #[strum(message = "Display CPU registers (GPR, control, debug, segment).\n(usage: registers)")]
+    Registers,
+
+    #[strum(message = "Switch to a different thread/vCPU.\n(usage: thread <thread_id>)")]
+    Thread,
+
     #[strum(message = "Exit the application.")]
     Quit,
 }
@@ -238,6 +245,8 @@ impl ReplCommand {
             Self::Lm => CompletionStrategy::None,
             Self::Attach => CompletionStrategy::Process,
             Self::Detach => CompletionStrategy::None,
+            Self::Registers => CompletionStrategy::None,
+            Self::Thread => CompletionStrategy::Thread,
         }
     }
 }
@@ -245,10 +254,14 @@ impl ReplCommand {
 /// Cached process info for completion (name, PID)
 type ProcessCache = Vec<(String, u64)>;
 
+/// Cached thread IDs for completion
+type ThreadCache = Vec<String>;
+
 struct MyCompleter {
     symbols: Arc<RwLock<SymbolIndex>>,
     types: Arc<RwLock<SymbolIndex>>,
     processes: Arc<RwLock<ProcessCache>>,
+    threads: Arc<RwLock<ThreadCache>>,
 }
 
 impl Completer for MyCompleter {
@@ -334,6 +347,23 @@ impl Completer for MyCompleter {
                         })
                         .collect();
                 }
+
+                CompletionStrategy::Thread => {
+                    let threads = self.threads.read().unwrap();
+                    return threads
+                        .iter()
+                        .filter(|tid| tid.starts_with(prefix))
+                        .map(|tid| Suggestion {
+                            value: tid.clone(),
+                            description: Some("Thread/vCPU".to_string()),
+                            style: None,
+                            extra: None,
+                            match_indices: None,
+                            span: Span::new(arg_start + prefix_offset, pos),
+                            append_whitespace: true,
+                        })
+                        .collect();
+                }
             }
         }
 
@@ -349,6 +379,71 @@ macro_rules! error {
     ($($arg:tt)*) => {
         error(&format!($($arg)*))
     };
+}
+
+fn print_break_info(
+    client: &mut GdbClient,
+    register_map: &RegisterMap,
+    debugger: &DebuggerContext,
+    thread_id: &str,
+) {
+    let regs = match client.read_registers() {
+        Ok(r) => r,
+        Err(_) => {
+            println!("{} thread {}\n", "break:".magenta(), thread_id);
+            return;
+        }
+    };
+
+    let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
+    let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
+    let cr3_masked = cr3 & 0x000F_FFFF_FFFF_F000;
+    let kernel_dtb_masked = debugger.guest.ntoskrnl.dtb().0.0 & 0x000F_FFFF_FFFF_F000;
+
+    let (context, symbol) = if cr3_masked == kernel_dtb_masked {
+        let sym = debugger
+            .guest
+            .ntoskrnl
+            .closest_symbol(&debugger.symbols, VirtAddr(rip))
+            .map(|(s, o)| {
+                if o == 0 { s } else { format!("{}+{:#x}", s, o) }
+            })
+            .unwrap_or_else(|_| format!("{:#x}", rip));
+        ("kernel".to_string(), sym)
+    } else {
+        let processes = debugger
+            .guest
+            .enumerate_processes(&debugger.kvm, &debugger.symbols)
+            .unwrap_or_default();
+
+        match processes.iter().find(|p| (p.dtb.0.0 & 0x000F_FFFF_FFFF_F000) == cr3_masked) {
+            Some(proc) => {
+                let sym = debugger
+                    .symbols
+                    .find_closest_symbol_for_address(proc.dtb, VirtAddr(rip))
+                    .map(|(module, sym, offset)| {
+                        if offset == 0 {
+                            format!("{}!{}", module, sym)
+                        } else {
+                            format!("{}!{}+{:#x}", module, sym, offset)
+                        }
+                    })
+                    .unwrap_or_else(|| format!("{:#x}", rip));
+                (proc.name.clone(), sym)
+            }
+            None => ("unknown".to_string(), format!("{:#x}", rip))
+        }
+    };
+
+    println!(
+        "{} {} {} {} {} {}\n",
+        "break:".magenta(),
+        format!("thread {}", thread_id).bright_black(),
+        "in".bright_black(),
+        context.cyan(),
+        "at".bright_black(),
+        symbol.green()
+    );
 }
 
 fn hexdump(start_address: VirtAddr, data: &[u8]) {
@@ -429,6 +524,12 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
 
     let register_map = client.get_register_map().map_err(|e| format!("failed to get register map: {:?}", e))?;
 
+    let mut current_thread = client
+        .get_stopped_thread_id()
+        .unwrap_or_else(|_| "1".to_string());
+
+    print_break_info(&mut client, &register_map, debugger, &current_thread);
+
     let min_completion_width: u16 = 0;
     let max_completion_width: u16 = 50;
     let max_completion_height: u16 = 12;
@@ -489,13 +590,17 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
         .guest
         .enumerate_processes(&debugger.kvm, &debugger.symbols)
         .map(|procs| procs.into_iter().map(|p| (p.name, p.pid)).collect())
-        .unwrap_or_default();   
+        .unwrap_or_default();
     let shared_processes: Arc<RwLock<ProcessCache>> = Arc::new(RwLock::new(initial_processes));
+
+    let initial_threads = client.get_thread_list().unwrap_or_default();
+    let shared_threads: Arc<RwLock<ThreadCache>> = Arc::new(RwLock::new(initial_threads));
 
     let completor = Box::new(MyCompleter {
         symbols: Arc::clone(&shared_symbols),
         types: Arc::clone(&shared_types),
         processes: Arc::clone(&shared_processes),
+        threads: Arc::clone(&shared_threads),
     });
 
     let had_content = Arc::new(AtomicBool::new(false));
@@ -989,6 +1094,81 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                                 println!("detached, now in kernel context\n");
                             }
                         }
+                        Ok(ReplCommand::Registers) => {
+                            if client.is_running {
+                                error!("VM is running");
+                                continue;
+                            }
+
+                            if let Err(e) = client.set_current_thread(&current_thread) {
+                                error!("failed to set thread context: {:?}", e);
+                                continue;
+                            }
+
+                            let regs = match client.read_registers() {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("failed to read registers: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            let read_reg = |name: &str| -> String {
+                                register_map
+                                    .read_u64(name, &regs)
+                                    .map(|v| format!("{:#018x}", VirtAddr(v)))
+                                    .unwrap_or_else(|| "N/A".to_string())
+                            };
+
+                            println!("rax={}  rbx={}  rcx={}", read_reg("rax"), read_reg("rbx"), read_reg("rcx"));
+                            println!("rdx={}  rsi={}  rdi={}", read_reg("rdx"), read_reg("rsi"), read_reg("rdi"));
+                            println!("rsp={}  rbp={}  rip={}", read_reg("rsp"), read_reg("rbp"), read_reg("rip"));
+                            println!("r8 ={}  r9 ={}  r10={}", read_reg("r8"), read_reg("r9"), read_reg("r10"));
+                            println!("r11={}  r12={}  r13={}", read_reg("r11"), read_reg("r12"), read_reg("r13"));
+                            println!("r14={}  r15={}  rflags={}", read_reg("r14"), read_reg("r15"), read_reg("eflags"));
+                            println!("");
+
+                            println!("cr0={}  cr2={}  cr3={}", read_reg("cr0"), read_reg("cr2"), read_reg("cr3"));
+                            println!("cr4={}  cr8={}", read_reg("cr4"), read_reg("cr8"));
+                            println!("");
+
+                            // println!("dr0={}  dr1={}  dr2={}", read_reg("dr0"), read_reg("dr1"), read_reg("dr2"));
+                            // println!("dr3={}  dr6={}  dr7={}", read_reg("dr3"), read_reg("dr6"), read_reg("dr7"));
+                            // println!("");
+
+                            println!("cs={}  ds={}  es={}", read_reg("cs"), read_reg("ds"), read_reg("es"));
+                            println!("fs={}  gs={}  ss={}", read_reg("fs"), read_reg("gs"), read_reg("ss"));
+                            println!("");
+                        }
+                        Ok(ReplCommand::Thread) => {
+                            if client.is_running {
+                                error!("VM is running");
+                                continue;
+                            }
+
+                            let thread_id = require_arg!(parts, 1, ReplCommand::Thread);
+
+                            let threads = match client.get_thread_list() {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    error!("failed to get thread list: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            if !threads.iter().any(|t| t == thread_id) {
+                                error!("thread '{}' not found (use 'lt' to list threads)", thread_id);
+                                continue;
+                            }
+
+                            if let Err(e) = client.set_current_thread(thread_id) {
+                                error!("failed to switch thread: {:?}", e);
+                                continue;
+                            }
+
+                            current_thread = thread_id.to_string();
+                            println!("switched to thread {}\n", current_thread);
+                        }
                         Err(_) => {
                             println!(
                                 "unknown command: '{}' (try pressing tab to see available commands)\n",
@@ -1010,7 +1190,14 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                 if client.is_running {
                     if let Err(e) = client.interrupt() {
                         error!("failed to interrupt: {:?}", e);
+                        continue;
                     }
+
+                    if let Ok(thread_id) = client.get_stopped_thread_id() {
+                        current_thread = thread_id;
+                    }
+                    println!();
+                    print_break_info(&mut client, &register_map, debugger, &current_thread);
                 } else {
                     error!("VM is already paused");
                 }
