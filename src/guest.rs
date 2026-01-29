@@ -5,10 +5,10 @@ use crate::{
     symbols::{SymbolStore, TypeInfo},
     types::*,
 };
-use indicatif::{ProgressBar, ProgressStyle};
-use zerocopy::{FromBytes, IntoBytes};
-use pelite::pe64::{Pe, PeView};
 use anyhow::Result;
+use indicatif::{ProgressBar, ProgressStyle};
+use pelite::pe64::{Pe, PeView};
+use zerocopy::{FromBytes, IntoBytes};
 
 /// used for enumeration without loading full WinObject
 #[derive(Debug, Clone)]
@@ -31,12 +31,18 @@ pub struct ModuleInfo {
 impl ModuleInfo {
     pub fn new(name: String, base_address: VirtAddr, size: u32) -> Self {
         let short_name = Self::derive_short_name(&name);
-        Self { name, short_name, base_address, size }
+        Self {
+            name,
+            short_name,
+            base_address,
+            size,
+        }
     }
 
     pub fn derive_short_name(name: &str) -> String {
         let filename = name.rsplit(['\\', '/']).next().unwrap_or(name);
-        let without_ext = filename.rsplit_once('.')
+        let without_ext = filename
+            .rsplit_once('.')
             .map(|(base, _)| base)
             .unwrap_or(filename);
 
@@ -155,9 +161,15 @@ impl WinObject {
         Ok(SymbolRef { obj: self, rva })
     }
 
-    pub fn closest_symbol(&self, symbols: &SymbolStore, address: VirtAddr) -> Result<(String, u32), String> {
+    pub fn closest_symbol(
+        &self,
+        symbols: &SymbolStore,
+        address: VirtAddr,
+    ) -> Result<(String, u32), String> {
         let guid = self.guid.ok_or("no guid found for binary")?;
-        let result = symbols.get_address_of_closest_symbol(guid, self.base_address, address).ok_or(format!("no symbol found near address `{:#x}`", address))?;
+        let result = symbols
+            .get_address_of_closest_symbol(guid, self.base_address, address)
+            .ok_or(format!("no symbol found near address `{:#x}`", address))?;
         Ok(result)
     }
 
@@ -630,7 +642,10 @@ impl Guest {
             .ok_or("Peb field not found")?
             .offset as u64;
 
-        let peb_addr: VirtAddr = self.ntoskrnl.memory(kvm).read(info.eprocess_va + peb_offset)?;
+        let peb_addr: VirtAddr = self
+            .ntoskrnl
+            .memory(kvm)
+            .read(info.eprocess_va + peb_offset)?;
 
         if peb_addr.0 == 0 {
             return Err("process has no PEB (kernel process?)".into());
@@ -753,7 +768,10 @@ impl Guest {
 
             let name = if name_length > 0 && name_buffer.0 != 0 {
                 let mut name_buf = vec![0u8; name_length as usize];
-                if process_memory.read_bytes(name_buffer, &mut name_buf).is_ok() {
+                if process_memory
+                    .read_bytes(name_buffer, &mut name_buf)
+                    .is_ok()
+                {
                     // Convert UTF-16LE to String
                     let u16_chars: Vec<u16> = name_buf
                         .chunks_exact(2)
@@ -892,12 +910,9 @@ impl Guest {
                 continue;
             }
 
-            if let Ok((job, guid)) = SymbolStore::extract_download_job(
-                kvm,
-                dtb,
-                module.base_address,
-                &module.name,
-            ) {
+            if let Ok((job, guid)) =
+                SymbolStore::extract_download_job(kvm, dtb, module.base_address, &module.name)
+            {
                 if symbols.has_guid(guid) {
                     already_loaded.push((job, guid, module.clone()));
                     continue;
@@ -919,14 +934,17 @@ impl Guest {
             );
 
             for (job, guid, module) in already_loaded.iter().chain(jobs_with_info.iter()) {
-                if symbols.load_downloaded_pdb(
-                    job,
-                    *guid,
-                    &module.name,
-                    module.base_address,
-                    module.size,
-                    dtb,
-                ).is_ok() {
+                if symbols
+                    .load_downloaded_pdb(
+                        job,
+                        *guid,
+                        &module.name,
+                        module.base_address,
+                        module.size,
+                        dtb,
+                    )
+                    .is_ok()
+                {
                     loaded += 1;
                 }
                 pb.inc(1);
@@ -954,12 +972,9 @@ impl Guest {
         let mut loaded = 0;
 
         for module in &modules {
-            if let Ok((job, guid)) = SymbolStore::extract_download_job(
-                kvm,
-                dtb,
-                module.base_address,
-                &module.name,
-            ) {
+            if let Ok((job, guid)) =
+                SymbolStore::extract_download_job(kvm, dtb, module.base_address, &module.name)
+            {
                 if symbols.has_guid(guid) {
                     already_loaded.push((job, guid, module.clone()));
                     continue;
@@ -981,14 +996,17 @@ impl Guest {
             );
 
             for (job, guid, module) in already_loaded.iter().chain(jobs_with_info.iter()) {
-                if symbols.load_downloaded_pdb(
-                    job,
-                    *guid,
-                    &module.name,
-                    module.base_address,
-                    module.size,
-                    dtb,
-                ).is_ok() {
+                if symbols
+                    .load_downloaded_pdb(
+                        job,
+                        *guid,
+                        &module.name,
+                        module.base_address,
+                        module.size,
+                        dtb,
+                    )
+                    .is_ok()
+                {
                     loaded += 1;
                 }
                 pb.inc(1);

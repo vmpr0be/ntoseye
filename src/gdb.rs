@@ -3,6 +3,8 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use crate::types::VirtAddr;
+
 #[derive(Debug)]
 pub enum GdbError {
     Io(io::Error),
@@ -22,6 +24,148 @@ pub struct RegisterInfo {
 pub struct RegisterMap {
     by_name: HashMap<String, RegisterInfo>,
     ordered: Vec<RegisterInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Breakpoint {
+    pub id: u32,
+    pub address: VirtAddr,
+    pub enabled: bool,
+    pub target_cr3: Option<u64>,
+    pub symbol: Option<String>,
+}
+
+pub struct BreakpointManager {
+    breakpoints: HashMap<u32, Breakpoint>,
+    next_id: u32,
+}
+
+impl BreakpointManager {
+    pub fn new() -> Self {
+        Self {
+            breakpoints: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    pub fn add(
+        &mut self,
+        client: &mut GdbClient,
+        address: VirtAddr,
+        target_cr3: Option<u64>,
+        symbol: Option<String>,
+    ) -> Result<u32, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        client
+            .set_breakpoint(address.0, 1)
+            .map_err(|e| format!("failed to set breakpoint: {:?}", e))?;
+
+        let bp = Breakpoint {
+            id,
+            address,
+            enabled: true,
+            target_cr3,
+            symbol,
+        };
+
+        self.breakpoints.insert(id, bp);
+        Ok(id)
+    }
+
+    pub fn remove(&mut self, client: &mut GdbClient, id: u32) -> Result<(), String> {
+        let bp = self
+            .breakpoints
+            .remove(&id)
+            .ok_or_else(|| format!("breakpoint {} not found", id))?;
+
+        if bp.enabled {
+            client
+                .remove_breakpoint(bp.address.0, 1)
+                .map_err(|e| format!("failed to remove breakpoint: {:?}", e))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn enable(&mut self, client: &mut GdbClient, id: u32) -> Result<(), String> {
+        let bp = self
+            .breakpoints
+            .get_mut(&id)
+            .ok_or_else(|| format!("breakpoint {} not found", id))?;
+
+        if bp.enabled {
+            return Ok(());
+        }
+
+        client
+            .set_breakpoint(bp.address.0, 1)
+            .map_err(|e| format!("failed to enable breakpoint: {:?}", e))?;
+
+        bp.enabled = true;
+        Ok(())
+    }
+
+    pub fn disable(&mut self, client: &mut GdbClient, id: u32) -> Result<(), String> {
+        let bp = self
+            .breakpoints
+            .get_mut(&id)
+            .ok_or_else(|| format!("breakpoint {} not found", id))?;
+
+        if !bp.enabled {
+            return Ok(());
+        }
+
+        client
+            .remove_breakpoint(bp.address.0, 1)
+            .map_err(|e| format!("failed to disable breakpoint: {:?}", e))?;
+
+        bp.enabled = false;
+        Ok(())
+    }
+
+    pub fn list(&self) -> Vec<&Breakpoint> {
+        let mut bps: Vec<_> = self.breakpoints.values().collect();
+        bps.sort_by_key(|bp| bp.id);
+        bps
+    }
+
+    pub fn has_enabled_breakpoints(&self) -> bool {
+        self.breakpoints.values().any(|bp| bp.enabled)
+    }
+
+    pub fn check_breakpoint_hit(&self, rip: u64, cr3: u64) -> BreakpointHitResult {
+        let cr3_masked = cr3 & 0x000F_FFFF_FFFF_F000;
+
+        for bp in self.breakpoints.values() {
+            if bp.address.0 == rip && bp.enabled {
+                match bp.target_cr3 {
+                    None => return BreakpointHitResult::Hit(bp.clone()),
+                    Some(target) => {
+                        let target_masked = target & 0x000F_FFFF_FFFF_F000;
+                        if target_masked == cr3_masked {
+                            return BreakpointHitResult::Hit(bp.clone());
+                        } else {
+                            return BreakpointHitResult::WrongProcess(bp.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        BreakpointHitResult::NotBreakpoint
+    }
+}
+
+#[derive(Debug)]
+pub enum BreakpointHitResult {
+    /// Breakpoint hit and CR3 matches (or is global)
+    Hit(Breakpoint),
+    /// Breakpoint hit but CR3 doesn't match - should single-step and continue
+    WrongProcess(Breakpoint),
+    /// RIP doesn't match any breakpoint
+    NotBreakpoint,
 }
 
 impl RegisterMap {
@@ -75,14 +219,15 @@ impl RegisterMap {
                 let size_bits: usize = bitsize.parse().unwrap_or(0);
                 let size_bytes = size_bits / 8;
 
-                let regnum: usize = if let Some(explicit) = explicit_regnum.and_then(|s| s.parse().ok()) {
-                    next_regnum = Some(explicit + 1);
-                    explicit
-                } else {
-                    let num = next_regnum.unwrap_or(0);
-                    next_regnum = Some(num + 1);
-                    num
-                };
+                let regnum: usize =
+                    if let Some(explicit) = explicit_regnum.and_then(|s| s.parse().ok()) {
+                        next_regnum = Some(explicit + 1);
+                        explicit
+                    } else {
+                        let num = next_regnum.unwrap_or(0);
+                        next_regnum = Some(num + 1);
+                        num
+                    };
 
                 let reg = RegisterInfo {
                     name: name.to_string(),
@@ -147,7 +292,9 @@ impl GdbClient {
 
         client.force_stop_and_resync()?;
 
-        let _ = client.send_packet("qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;vContSupported+")?;
+        let _ = client.send_packet(
+            "qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;vContSupported+",
+        )?;
 
         let _ = client.enable_no_ack_mode();
 
@@ -265,34 +412,6 @@ impl GdbClient {
         }
     }
 
-    pub fn set_hardware_breakpoint(&mut self, addr: u64, kind: u32) -> Result<(), GdbError> {
-        let response = self.send_packet(&format!("Z1,{:x},{:x}", addr, kind))?;
-        if response == "OK" || response.is_empty() {
-            Ok(())
-        } else if response.starts_with('E') {
-            Err(GdbError::Protocol(format!(
-                "failed to set hardware breakpoint: {}",
-                response
-            )))
-        } else {
-            Err(GdbError::NotSupported)
-        }
-    }
-
-    pub fn remove_hardware_breakpoint(&mut self, addr: u64, kind: u32) -> Result<(), GdbError> {
-        let response = self.send_packet(&format!("z1,{:x},{:x}", addr, kind))?;
-        if response == "OK" || response.is_empty() {
-            Ok(())
-        } else if response.starts_with('E') {
-            Err(GdbError::Protocol(format!(
-                "failed to remove hardware breakpoint: {}",
-                response
-            )))
-        } else {
-            Err(GdbError::NotSupported)
-        }
-    }
-
     pub fn read_registers(&mut self) -> Result<Vec<u8>, GdbError> {
         let response = self.send_packet("g")?;
 
@@ -339,7 +458,10 @@ impl GdbClient {
             let mut buf = [0u8; 1];
             self.stream.read_exact(&mut buf)?;
             if buf[0] != b'+' {
-                return Err(GdbError::Protocol("expected ACK".to_string()));
+                return Err(GdbError::Protocol(format!(
+                    "expected ACK, got 0x{:02x}",
+                    buf[0]
+                )));
             }
         }
 
@@ -347,6 +469,8 @@ impl GdbClient {
     }
 
     pub fn continue_execution(&mut self) -> Result<(), GdbError> {
+        // set continue thread to -1 (all threads)
+        let _ = self.send_packet("Hc-1")?;
         self.send_command_no_reply("c")?;
         self.is_running = true;
         Ok(())
@@ -381,6 +505,30 @@ impl GdbClient {
         let response = self.read_packet()?;
         self.is_running = false;
         Ok(response)
+    }
+
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), GdbError> {
+        self.stream.set_read_timeout(timeout)?;
+        Ok(())
+    }
+
+    pub fn try_wait_for_stop(&mut self) -> Result<Option<String>, GdbError> {
+        if !self.is_running {
+            return Ok(Some(self.query_halt_reason()?));
+        }
+
+        match self.read_packet() {
+            Ok(response) => {
+                self.is_running = false;
+                Ok(Some(response))
+            }
+            Err(GdbError::Io(ref e))
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn interrupt(&mut self) -> Result<(), GdbError> {
@@ -476,13 +624,13 @@ impl GdbClient {
             offset += data.len();
 
             match marker {
-                "l" => break, // last chunk
+                "l" => break,    // last chunk
                 "m" => continue, // more data
                 _ => {
                     return Err(GdbError::Protocol(format!(
                         "unexpected qXfer response: {}",
                         response
-                    )))
+                    )));
                 }
             }
         }
@@ -540,7 +688,7 @@ impl GdbClient {
                     return Err(GdbError::Protocol(format!(
                         "unexpected qXfer response for {}: {}",
                         filename, response
-                    )))
+                    )));
                 }
             }
         }

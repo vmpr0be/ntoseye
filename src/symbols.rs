@@ -453,9 +453,11 @@ impl SymbolStore {
         size: u32,
         dtb: Dtb,
     ) -> Result<u128, String> {
-        if let Some(existing) = self.modules.iter().find(|m| {
-            m.base_address == base_address && m.dtb.0.0 == dtb.0.0
-        }) {
+        if let Some(existing) = self
+            .modules
+            .iter()
+            .find(|m| m.base_address == base_address && m.dtb.0.0 == dtb.0.0)
+        {
             return Ok(existing.guid);
         }
 
@@ -501,7 +503,7 @@ impl SymbolStore {
 
         for module in &self.modules {
             if let Some(filter_dtb) = dtb {
-                if module.dtb.0 .0 != filter_dtb.0 .0 {
+                if module.dtb.0.0 != filter_dtb.0.0 {
                     continue;
                 }
             }
@@ -535,7 +537,7 @@ impl SymbolStore {
 
         for module in &self.modules {
             if let Some(filter_dtb) = dtb {
-                if module.dtb.0 .0 != filter_dtb.0 .0 {
+                if module.dtb.0.0 != filter_dtb.0.0 {
                     continue;
                 }
             }
@@ -566,7 +568,7 @@ impl SymbolStore {
 
     pub fn find_type_across_modules(&self, dtb: Dtb, type_name: &str) -> Option<TypeInfo> {
         for module in &self.modules {
-            if module.dtb.0 .0 != dtb.0 .0 {
+            if module.dtb.0.0 != dtb.0.0 {
                 continue;
             }
             if let Some(type_info) = self.dump_struct_with_types(module.guid, type_name) {
@@ -578,7 +580,7 @@ impl SymbolStore {
 
     pub fn find_symbol_across_modules(&self, dtb: Dtb, symbol_name: &str) -> Option<VirtAddr> {
         for module in &self.modules {
-            if module.dtb.0 .0 != dtb.0 .0 {
+            if module.dtb.0.0 != dtb.0.0 {
                 continue;
             }
             if let Some(rva) = self.get_rva_of_symbol(module.guid, symbol_name) {

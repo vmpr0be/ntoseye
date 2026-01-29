@@ -1,9 +1,9 @@
 use owo_colors::OwoColorize;
 use std::{
-    fmt::{self, Binary, LowerHex, UpperHex},
+    fmt,
     ops::{Add, BitAnd, BitOr, Shr, Sub},
 };
-use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 #[derive(Clone, Copy, Debug, PartialEq, FromBytes, IntoBytes, Immutable)]
 pub struct VirtAddr(pub u64);

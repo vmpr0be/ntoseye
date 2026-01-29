@@ -151,9 +151,13 @@ impl DebuggerContext {
 
         let name = process_info.name.clone();
 
-        let _ = self.guest.load_all_process_module_symbols(&self.kvm, &mut self.symbols, &process_info);
+        let _ =
+            self.guest
+                .load_all_process_module_symbols(&self.kvm, &mut self.symbols, &process_info);
 
-        let winobj = self.guest.winobj_from_process_info(&self.kvm, &self.symbols, &process_info)?;
+        let winobj =
+            self.guest
+                .winobj_from_process_info(&self.kvm, &self.symbols, &process_info)?;
 
         self.current_process = Some(winobj);
         self.current_process_info = Some(process_info);
