@@ -8,7 +8,6 @@ use reedline::{
     DescriptionMode, Emacs, Highlighter, IdeMenu, KeyCode, KeyModifiers, MenuBuilder,
     ReedlineEvent, ReedlineMenu, StyledText, default_emacs_keybindings,
 };
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -1064,40 +1063,38 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                                                         &current_thread,
                                                     );
 
-                                                    // step past the breakpoint instruction
-                                                    // (dont think gdbstub does this)
-                                                    if let Err(e) = client.step() {
-                                                        error!(
-                                                            "failed to step past breakpoint: {:?}",
-                                                            e
-                                                        );
-                                                        break;
-                                                    }
-                                                    if let Err(e) = client.wait_for_stop() {
-                                                        error!(
-                                                            "failed to wait after step: {:?}",
-                                                            e
-                                                        );
-                                                        break;
-                                                    }
-
                                                     // reset the breakpoint to ensure it's still active
                                                     let _ = client.set_breakpoint(bp.address.0, 1);
 
                                                     break;
                                                 }
-                                                BreakpointHitResult::WrongProcess(_bp) => {
+                                                BreakpointHitResult::WrongProcess(bp) => {
+                                                    // temporarily disable the breakpoint to step over it
+                                                    if let Err(e) = breakpoints.disable(&mut client, bp.id) {
+                                                        error!("failed to disable breakpoint for step: {}", e);
+                                                        break;
+                                                    }
+
                                                     if let Err(e) = client.step() {
+                                                        let _ = breakpoints.enable(&mut client, bp.id);
                                                         error!("failed to step: {:?}", e);
                                                         break;
                                                     }
                                                     if let Err(e) = client.wait_for_stop() {
+                                                        let _ = breakpoints.enable(&mut client, bp.id);
                                                         error!(
                                                             "failed to wait after step: {:?}",
                                                             e
                                                         );
                                                         break;
                                                     }
+
+                                                    // reenable the breakpoint after stepping
+                                                    if let Err(e) = breakpoints.enable(&mut client, bp.id) {
+                                                        error!("failed to re-enable breakpoint: {}", e);
+                                                        break;
+                                                    }
+
                                                     if let Err(e) = client.continue_execution() {
                                                         error!("failed to continue: {:?}", e);
                                                         break;
@@ -1461,14 +1458,53 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                                 continue;
                             }
 
+                            // check if we're at a breakpoint address and temporarily remove it
+                            let regs = match client.read_registers() {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("failed to read registers: {:?}", e);
+                                    continue;
+                                }
+                            };
+                            let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
+
+                            let bp_at_rip = breakpoints
+                                .list()
+                                .iter()
+                                .find(|bp| bp.enabled && bp.address.0 == rip)
+                                .map(|bp| bp.id);
+
+                            // temporarily disable breakpoint at current rip if present
+                            if let Some(bp_id) = bp_at_rip {
+                                if let Err(e) = breakpoints.disable(&mut client, bp_id) {
+                                    error!("failed to disable breakpoint for step: {}", e);
+                                    continue;
+                                }
+                            }
+
                             if let Err(e) = client.step() {
+                                // reenable breakpoint on error
+                                if let Some(bp_id) = bp_at_rip {
+                                    let _ = breakpoints.enable(&mut client, bp_id);
+                                }
                                 error!("failed to step: {:?}", e);
                                 continue;
                             }
 
                             if let Err(e) = client.wait_for_stop() {
+                                // reenable breakpoint on error
+                                if let Some(bp_id) = bp_at_rip {
+                                    let _ = breakpoints.enable(&mut client, bp_id);
+                                }
                                 error!("failed to wait after step: {:?}", e);
                                 continue;
+                            }
+
+                            // reenable the breakpoint after stepping
+                            if let Some(bp_id) = bp_at_rip {
+                                if let Err(e) = breakpoints.enable(&mut client, bp_id) {
+                                    error!("failed to re-enable breakpoint after step: {}", e);
+                                }
                             }
 
                             if let Ok(tid) = client.get_stopped_thread_id() {
