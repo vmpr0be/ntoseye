@@ -13,6 +13,7 @@ use pelite::{
     image::GUID,
     pe64::{Pe, debug::CodeView},
 };
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use reqwest;
 use std::{
     cell::RefCell,
@@ -43,7 +44,7 @@ pub struct SymbolStore {
     index: HashMap<u128, SymbolIndex>,
     index_types: HashMap<u128, SymbolIndex>,
 
-    modules: Vec<LoadedModule>,
+    modules: HashMap<u64, LoadedModule>,
 }
 
 fn guid_to_u128(guid: GUID) -> u128 {
@@ -121,38 +122,19 @@ fn download_pdb_with_progress(
 
 pub fn download_pdbs_parallel(jobs: Vec<DownloadJob>) -> Vec<Result<PathBuf, String>> {
     let mp = Arc::new(MultiProgress::new());
-    let jobs_with_status: Vec<_> = jobs
-        .into_iter()
-        .map(|j| {
-            let needs = j.needs_download();
-            (j, needs)
-        })
-        .collect();
 
-    let handles: Vec<_> = jobs_with_status
-        .iter()
-        .filter(|(_, needs)| *needs)
-        .map(|(job, _)| {
-            let job = job.clone();
-            let mp = Arc::clone(&mp);
-            thread::spawn(move || download_pdb_with_progress(&job, &mp))
-        })
-        .collect();
-
-    for h in handles {
-        let _ = h.join();
-    }
-
-    jobs_with_status
-        .into_iter()
-        .map(|(job, _)| {
-            if job.path.exists() {
-                Ok(job.path)
-            } else {
-                Err(format!("failed to download {}", job.filename))
+    jobs.into_par_iter()
+        .map(|job| {
+            if !job.needs_download() {
+                return Ok(job.path);
             }
+
+            let mp = Arc::clone(&mp);
+            download_pdb_with_progress(&job, &mp)
+                .map(|_| job.path)
+                .map_err(|e| e.to_string())
         })
-        .collect()
+        .collect::<Vec<_>>()
 }
 
 fn download_pdb_single(job: &DownloadJob) -> Result<(), String> {
@@ -273,7 +255,7 @@ impl SymbolStore {
             mmaps: HashMap::new(),
             index: HashMap::new(),
             index_types: HashMap::new(),
-            modules: Vec::new(),
+            modules: HashMap::new(),
         }
     }
 
@@ -453,11 +435,7 @@ impl SymbolStore {
         size: u32,
         dtb: Dtb,
     ) -> Result<u128, String> {
-        if let Some(existing) = self
-            .modules
-            .iter()
-            .find(|m| m.base_address == base_address && m.dtb.0.0 == dtb.0.0)
-        {
+        if let Some(existing) = self.modules.get(&base_address.0) {
             return Ok(existing.guid);
         }
 
@@ -489,11 +467,7 @@ impl SymbolStore {
             dtb,
         };
 
-        let insert_pos = self
-            .modules
-            .binary_search_by_key(&base_address.0, |m| m.base_address.0)
-            .unwrap_or_else(|pos| pos);
-        self.modules.insert(insert_pos, module);
+        self.modules.insert(module.base_address.0, module);
 
         Ok(guid)
     }
@@ -501,7 +475,7 @@ impl SymbolStore {
     pub fn merged_symbol_index(&self, dtb: Option<Dtb>) -> SymbolIndex {
         let mut all_strings: Vec<String> = Vec::new();
 
-        for module in &self.modules {
+        for module in self.modules.values() {
             if let Some(filter_dtb) = dtb {
                 if module.dtb.0.0 != filter_dtb.0.0 {
                     continue;
@@ -535,7 +509,7 @@ impl SymbolStore {
     pub fn merged_types_index(&self, dtb: Option<Dtb>) -> SymbolIndex {
         let mut all_strings: Vec<String> = Vec::new();
 
-        for module in &self.modules {
+        for module in self.modules.values() {
             if let Some(filter_dtb) = dtb {
                 if module.dtb.0.0 != filter_dtb.0.0 {
                     continue;
@@ -567,7 +541,7 @@ impl SymbolStore {
     }
 
     pub fn find_type_across_modules(&self, dtb: Dtb, type_name: &str) -> Option<TypeInfo> {
-        for module in &self.modules {
+        for module in self.modules.values() {
             if module.dtb.0.0 != dtb.0.0 {
                 continue;
             }
@@ -579,7 +553,7 @@ impl SymbolStore {
     }
 
     pub fn find_symbol_across_modules(&self, dtb: Dtb, symbol_name: &str) -> Option<VirtAddr> {
-        for module in &self.modules {
+        for module in self.modules.values() {
             if module.dtb.0.0 != dtb.0.0 {
                 continue;
             }
@@ -597,7 +571,7 @@ impl SymbolStore {
     ) -> Option<(String, String, u32)> {
         use crate::guest::ModuleInfo;
 
-        for module in &self.modules {
+        for module in self.modules.values() {
             if module.dtb.0.0 != dtb.0.0 {
                 continue;
             }

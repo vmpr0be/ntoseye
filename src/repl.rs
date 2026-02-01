@@ -1270,7 +1270,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                                     builder.push_record(vec![
                                         "Name".to_string(),
                                         "PID".to_string(),
-                                        "CR3".to_string(),
+                                        "DTB".to_string(),
                                     ]);
 
                                     for proc in processes {
