@@ -258,6 +258,16 @@ enum ReplCommand {
     #[strum(message = "Enable a previously disabled breakpoint by ID.\n(usage: be <ID>)")]
     Be,
 
+    #[strum(
+        message = "Display stack backtrace. Scans the stack for return addresses pointing into known modules.\n(usage: k [count])"
+    )]
+    K,
+
+    #[strum(
+        message = "Display current VM status. Shows break information if stopped, or indicates if running.\n(usage: status)"
+    )]
+    Status,
+
     #[strum(message = "Exit the application.")]
     Quit,
 }
@@ -284,6 +294,8 @@ impl ReplCommand {
             Self::Bc => CompletionStrategy::Breakpoint,
             Self::Bd => CompletionStrategy::Breakpoint,
             Self::Be => CompletionStrategy::Breakpoint,
+            Self::K => CompletionStrategy::None,
+            Self::Status => CompletionStrategy::None,
         }
     }
 }
@@ -1714,6 +1726,185 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<(), String> {
                                 Err(e) => {
                                     error!("{}", e);
                                 }
+                            }
+                        }
+                        // TODO look into using UNWIND info?
+                        Ok(ReplCommand::K) => {
+                            if client.is_running {
+                                error!("VM is running");
+                                continue;
+                            }
+
+                            let frame_limit: Option<usize> = parts.get(1).and_then(|s| s.parse().ok());
+
+                            if let Err(e) = client.set_current_thread(&current_thread) {
+                                error!("failed to set thread context: {:?}", e);
+                                continue;
+                            }
+
+                            let regs = match client.read_registers() {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    error!("failed to read registers: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            let rip = register_map.read_u64("rip", &regs).unwrap_or(0);
+                            let rsp = register_map.read_u64("rsp", &regs).unwrap_or(0);
+                            let cr3 = register_map.read_u64("cr3", &regs).unwrap_or(0);
+
+                            let cr3_masked = cr3 & 0x000F_FFFF_FFFF_F000;
+                            let kernel_dtb_masked =
+                                debugger.guest.ntoskrnl.dtb().0.0 & 0x000F_FFFF_FFFF_F000;
+                            let is_kernel = cr3_masked == kernel_dtb_masked;
+
+                            // get module ranges for validating return addresses
+                            let modules = if is_kernel {
+                                debugger
+                                    .guest
+                                    .get_kernel_modules(&debugger.kvm, &debugger.symbols)
+                                    .unwrap_or_default()
+                            } else if let Some(ref proc_info) = debugger.current_process_info {
+                                debugger
+                                    .guest
+                                    .get_process_modules(
+                                        &debugger.kvm,
+                                        &debugger.symbols,
+                                        proc_info,
+                                    )
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+
+                            let is_code_addr = |addr: u64| -> bool {
+                                modules.iter().any(|m| {
+                                    let start = m.base_address.0;
+                                    let end = start + m.size as u64;
+                                    addr >= start && addr < end
+                                })
+                            };
+
+                            let mem = debugger.get_current_process().memory(&debugger.kvm);
+
+                            let resolve_symbol = |addr: u64| -> String {
+                                if is_kernel {
+                                    debugger
+                                        .guest
+                                        .ntoskrnl
+                                        .closest_symbol(&debugger.symbols, VirtAddr(addr))
+                                        .map(|(s, o)| {
+                                            if o == 0 {
+                                                s
+                                            } else {
+                                                format!("{}+{:#x}", s, o)
+                                            }
+                                        })
+                                        .unwrap_or_else(|_| format!("{:#x}", addr))
+                                } else {
+                                    debugger
+                                        .symbols
+                                        .find_closest_symbol_for_address(
+                                            debugger.current_dtb(),
+                                            VirtAddr(addr),
+                                        )
+                                        .map(|(module, sym, offset)| {
+                                            if offset == 0 {
+                                                format!("{}!{}", module, sym)
+                                            } else {
+                                                format!("{}!{}+{:#x}", module, sym, offset)
+                                            }
+                                        })
+                                        .unwrap_or_else(|| format!("{:#x}", addr))
+                                }
+                            };
+
+                            let mut frames: Vec<(usize, u64, u64, String)> = Vec::new();
+                            const MAX_FRAMES: usize = 64;
+                            const STACK_SCAN_SIZE: usize = 0x1000;
+
+                            // frame 0 is current RIP
+                            frames.push((0, rsp, rip, resolve_symbol(rip)));
+
+                            let mut stack_data = vec![0u8; STACK_SCAN_SIZE];
+                            if mem.read_bytes(VirtAddr(rsp), &mut stack_data).is_ok() {
+                                // scan for potential return addresses
+                                for offset in (0..STACK_SCAN_SIZE - 8).step_by(8) {
+                                    if frames.len() >= MAX_FRAMES {
+                                        break;
+                                    }
+
+                                    let potential_addr = u64::from_le_bytes(
+                                        stack_data[offset..offset + 8].try_into().unwrap(),
+                                    );
+
+                                    if potential_addr == rip {
+                                        continue;
+                                    }
+
+                                    if is_code_addr(potential_addr) {
+                                        let stack_addr = rsp + offset as u64;
+                                        let symbol = resolve_symbol(potential_addr);
+                                        frames.push((
+                                            frames.len(),
+                                            stack_addr,
+                                            potential_addr,
+                                            symbol,
+                                        ));
+                                    }
+                                }
+                            }
+
+                            let total_frames = frames.len();
+                            let display_count = frame_limit.unwrap_or(total_frames).min(total_frames);
+                            let remaining = total_frames.saturating_sub(display_count);
+
+                            let mut builder = Builder::default();
+                            builder.push_record(vec![
+                                "#".to_string(),
+                                "Child SP".to_string(),
+                                "Return addr".to_string(),
+                                "Symbol".to_string(),
+                            ]);
+
+                            for (num, sp, addr, sym) in frames.into_iter().take(display_count) {
+                                builder.push_record(vec![
+                                    format!("{:02}  ", num),
+                                    format!("{:#018x}  ", VirtAddr(sp)),
+                                    format!("{:#018x}  ", VirtAddr(addr)),
+                                    sym,
+                                ]);
+                            }
+
+                            let mut table = builder.build();
+                            table
+                                .with(tabled::settings::Style::empty())
+                                .with(Padding::zero());
+                            println!("{}", table);
+
+                            if remaining > 0 {
+                                println!(
+                                    "{}",
+                                    format!("+{} more", remaining).bright_black()
+                                );
+                            }
+                            println!();
+                        }
+                        Ok(ReplCommand::Status) => {
+                            if client.is_running {
+                                println!("{}\n", "VM is running");
+                            } else {
+                                if let Err(e) = client.set_current_thread(&current_thread) {
+                                    error!("failed to set thread context: {:?}", e);
+                                    continue;
+                                }
+                                print_break_info(
+                                    &mut client,
+                                    &register_map,
+                                    debugger,
+                                    &current_thread,
+                                );
                             }
                         }
                         Err(_) => {
