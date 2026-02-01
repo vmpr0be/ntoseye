@@ -308,6 +308,90 @@ fn scan_large_pages(
     false
 }
 
+fn scan_small_pages(
+    kvm: &KvmHandle,
+    pa_table: u64,
+    va_base: u64,
+    va_min: u64,
+    va_max: u64,
+    level: usize,
+    candidates: &mut std::collections::BTreeSet<u64>,
+) {
+    if level == 0 {
+        return;
+    }
+
+    let page: [u8; 0x1000] = match kvm.read(PhysAddr(pa_table)) {
+        Ok(page) => page,
+        Err(_) => return,
+    };
+
+    let va_base = if level == 4 {
+        if !verify_pml4(&page, pa_table) {
+            return;
+        }
+        0
+    } else {
+        va_base
+    };
+
+    let ptes: &[PageTableEntry] = FromBytes::ref_from_bytes(&page).unwrap();
+
+    for i in 0..512 {
+        let va_current =
+            memory::sign_extend_48bit(va_base + ((i as u64) << PML_REGION_SIZE[level]));
+
+        if va_current < va_min {
+            continue;
+        }
+        if va_current > va_max {
+            return;
+        }
+
+        let pte = ptes[i];
+        if !pte.is_present() {
+            continue;
+        }
+
+        if level == 1 {
+            // Look for the ntoskrnl small page pattern:
+            // page i-1 is empty
+            // page i is ACTIVE-WRITE-SUPERVISOR-NOEXECUTE 0x8000000000000003
+            // pages i+1 to i+31 are ACTIVE-SUPERVISOR 0x01
+
+            if i == 0 {
+                continue;
+            }
+            if !ptes[i - 1].is_zero() {
+                continue;
+            }
+            if (pte.0 & 0x800000000000000f) != 0x8000000000000003 {
+                continue;
+            }
+
+            let mut valid = true;
+            for j in (i + 2)..std::cmp::min(i + 32, 512) {
+                if (ptes[j].0 & 0x0f) != 0x01 {
+                    valid = false;
+                    break;
+                }
+            }
+
+            if valid {
+                candidates.insert(va_current);
+            }
+            continue;
+        }
+
+        if pte.is_large_page() {
+            continue;
+        }
+
+        let next_table = pte.pte_frame_addr();
+        scan_small_pages(kvm, next_table, va_current, va_min, va_max, level - 1, candidates);
+    }
+}
+
 fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject, String> {
     const KERNEL_VA_MIN: u64 = 0xfffff80000000000;
     const KERNEL_VA_MAX: u64 = 0xfffff807ffffffff;
@@ -364,10 +448,33 @@ fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject, String> {
             }
         }
 
+        let mut candidates = std::collections::BTreeSet::new();
+        scan_small_pages(kvm, pa_dtb, 0, KERNEL_VA_MIN, KERNEL_VA_MAX, 4, &mut candidates);
+
+        for va in candidates {
+            let mut page_buf = [0u8; 0x1000];
+            if kernel_space.read_bytes(VirtAddr(va), &mut page_buf).is_err() {
+                continue;
+            }
+
+            // MZ
+            let header = u16::read_from_bytes(&page_buf[0..2]).unwrap();
+            if header != 0x5a4d {
+                continue;
+            }
+
+            // POOLCODE signature
+            for o in (0usize..0x1000).step_by(8) {
+                let poolcode = u64::read_from_bytes(&page_buf[o..o + 8]).unwrap();
+                if poolcode == 0x45444F434C4F4F50u64 {
+                    return Ok(WinObject::new(Dtb(PhysAddr(pa_dtb)), VirtAddr(va)));
+                }
+            }
+        }
+
         break;
     }
 
-    // TODO implement small page walking?
     Err("failed to find ntoskrnl base address".into())
 }
 
