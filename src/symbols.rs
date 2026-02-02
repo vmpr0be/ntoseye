@@ -15,7 +15,6 @@ use pelite::{
     pe64::{Pe, debug::CodeView},
 };
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use reqwest;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -279,72 +278,67 @@ impl SymbolStore {
         let debug = view.debug()?;
 
         for entry in debug.iter().filter_map(|e| e.entry().ok()) {
-            if let Some(cv) = entry.as_code_view() {
-                match cv {
-                    CodeView::Cv70 {
-                        image,
-                        pdb_file_name,
-                    } => {
-                        let guid_str = format!(
-                            "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                            image.Signature.Data1,
-                            image.Signature.Data2,
-                            image.Signature.Data3,
-                            image.Signature.Data4[0],
-                            image.Signature.Data4[1],
-                            image.Signature.Data4[2],
-                            image.Signature.Data4[3],
-                            image.Signature.Data4[4],
-                            image.Signature.Data4[5],
-                            image.Signature.Data4[6],
-                            image.Signature.Data4[7],
-                        );
+            if let Some(CodeView::Cv70 {
+                image,
+                pdb_file_name,
+            }) = entry.as_code_view()
+            {
+                let guid_str = format!(
+                    "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                    image.Signature.Data1,
+                    image.Signature.Data2,
+                    image.Signature.Data3,
+                    image.Signature.Data4[0],
+                    image.Signature.Data4[1],
+                    image.Signature.Data4[2],
+                    image.Signature.Data4[3],
+                    image.Signature.Data4[4],
+                    image.Signature.Data4[5],
+                    image.Signature.Data4[6],
+                    image.Signature.Data4[7],
+                );
 
-                        let url = format!(
-                            "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
-                            pdb_file_name, guid_str, image.Age, pdb_file_name
-                        );
+                let url = format!(
+                    "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
+                    pdb_file_name, guid_str, image.Age, pdb_file_name
+                );
 
-                        let stem = pdb_file_name
-                            .to_str()
-                            .ok()
-                            .and_then(|s| s.split('.').next())
-                            .unwrap_or("");
+                let stem = pdb_file_name
+                    .to_str()
+                    .ok()
+                    .and_then(|s| s.split('.').next())
+                    .unwrap_or("");
 
-                        let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
-                        let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
-                        let path = storage_dir.join(&filename);
+                let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
+                let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
+                let path = storage_dir.join(&filename);
 
-                        let job = DownloadJob {
-                            url,
-                            path: path.clone(),
-                            filename: format!("{}.pdb", stem),
-                        };
-                        download_pdb_single(&job)?;
+                let job = DownloadJob {
+                    url,
+                    path: path.clone(),
+                    filename: format!("{}.pdb", stem),
+                };
+                download_pdb_single(&job)?;
 
-                        let guid = guid_to_u128(image.Signature);
-                        let file = File::open(&path)?;
+                let guid = guid_to_u128(image.Signature);
+                let file = File::open(&path)?;
 
-                        let mmap = unsafe { Mmap::map(&file)? };
-                        let mmap = Arc::new(mmap);
-                        let mmap_slice: &[u8] = &mmap;
+                let mmap = unsafe { Mmap::map(&file)? };
+                let mmap = Arc::new(mmap);
+                let mmap_slice: &[u8] = &mmap;
 
-                        // we know `mmap` will live in `self.mmaps` as long as `self.pdbs` exists
-                        let static_slice: &'static [u8] =
-                            unsafe { std::mem::transmute(mmap_slice) };
-                        let cursor = Cursor::new(static_slice);
+                // we know `mmap` will live in `self.mmaps` as long as `self.pdbs` exists
+                let static_slice: &'static [u8] = unsafe { std::mem::transmute(mmap_slice) };
+                let cursor = Cursor::new(static_slice);
 
-                        let pdb = pdb::PDB::open(cursor)?;
+                let pdb = pdb::PDB::open(cursor)?;
 
-                        self.mmaps.insert(guid, mmap);
-                        self.pdbs.insert(guid, pdb.into());
+                self.mmaps.insert(guid, mmap);
+                self.pdbs.insert(guid, pdb.into());
 
-                        self.build_index(guid);
+                self.build_index(guid);
 
-                        return Ok(Some(guid_to_u128(image.Signature)));
-                    }
-                    _ => (),
-                }
+                return Ok(Some(guid_to_u128(image.Signature)));
             }
         }
 
@@ -368,53 +362,49 @@ impl SymbolStore {
         let debug = view.debug()?;
 
         for entry in debug.iter().filter_map(|e| e.entry().ok()) {
-            if let Some(cv) = entry.as_code_view() {
-                match cv {
-                    CodeView::Cv70 {
-                        image,
-                        pdb_file_name,
-                    } => {
-                        let guid_str = format!(
-                            "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                            image.Signature.Data1,
-                            image.Signature.Data2,
-                            image.Signature.Data3,
-                            image.Signature.Data4[0],
-                            image.Signature.Data4[1],
-                            image.Signature.Data4[2],
-                            image.Signature.Data4[3],
-                            image.Signature.Data4[4],
-                            image.Signature.Data4[5],
-                            image.Signature.Data4[6],
-                            image.Signature.Data4[7],
-                        );
+            if let Some(CodeView::Cv70 {
+                image,
+                pdb_file_name,
+            }) = entry.as_code_view()
+            {
+                let guid_str = format!(
+                    "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                    image.Signature.Data1,
+                    image.Signature.Data2,
+                    image.Signature.Data3,
+                    image.Signature.Data4[0],
+                    image.Signature.Data4[1],
+                    image.Signature.Data4[2],
+                    image.Signature.Data4[3],
+                    image.Signature.Data4[4],
+                    image.Signature.Data4[5],
+                    image.Signature.Data4[6],
+                    image.Signature.Data4[7],
+                );
 
-                        let url = format!(
-                            "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
-                            pdb_file_name, guid_str, image.Age, pdb_file_name
-                        );
+                let url = format!(
+                    "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
+                    pdb_file_name, guid_str, image.Age, pdb_file_name
+                );
 
-                        let stem = pdb_file_name
-                            .to_str()
-                            .ok()
-                            .and_then(|s| s.split('.').next())
-                            .unwrap_or("");
+                let stem = pdb_file_name
+                    .to_str()
+                    .ok()
+                    .and_then(|s| s.split('.').next())
+                    .unwrap_or("");
 
-                        let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
-                        let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
-                        let path = storage_dir.join(&filename);
+                let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
+                let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
+                let path = storage_dir.join(&filename);
 
-                        let guid = guid_to_u128(image.Signature);
-                        let job = DownloadJob {
-                            url,
-                            path,
-                            filename: format!("{}.pdb", stem),
-                        };
+                let guid = guid_to_u128(image.Signature);
+                let job = DownloadJob {
+                    url,
+                    path,
+                    filename: format!("{}.pdb", stem),
+                };
 
-                        return Ok(Some((job, guid)));
-                    }
-                    _ => (),
-                }
+                return Ok(Some((job, guid)));
             }
         }
 
@@ -471,10 +461,10 @@ impl SymbolStore {
         let mut all_strings: Vec<String> = Vec::new();
 
         for module in self.modules.values() {
-            if let Some(filter_dtb) = dtb {
-                if module.dtb != filter_dtb {
-                    continue;
-                }
+            if let Some(filter_dtb) = dtb
+                && module.dtb != filter_dtb
+            {
+                continue;
             }
 
             if let Some(index) = self.index.get(&module.guid) {
@@ -505,10 +495,10 @@ impl SymbolStore {
         let mut all_strings: Vec<String> = Vec::new();
 
         for module in self.modules.values() {
-            if let Some(filter_dtb) = dtb {
-                if module.dtb != filter_dtb {
-                    continue;
-                }
+            if let Some(filter_dtb) = dtb
+                && module.dtb != filter_dtb
+            {
+                continue;
             }
 
             if let Some(index) = self.index_types.get(&module.guid) {
@@ -572,13 +562,13 @@ impl SymbolStore {
             }
 
             let module_end = module.base_address.0.saturating_add(module.size as u64);
-            if address.0 >= module.base_address.0 && address.0 < module_end {
-                if let Some((sym_name, offset)) =
+            if address.0 >= module.base_address.0
+                && address.0 < module_end
+                && let Some((sym_name, offset)) =
                     self.get_address_of_closest_symbol(module.guid, module.base_address, address)
-                {
-                    let short_name = ModuleInfo::derive_short_name(&module.name);
-                    return Some((short_name, sym_name, offset));
-                }
+            {
+                let short_name = ModuleInfo::derive_short_name(&module.name);
+                return Some((short_name, sym_name, offset));
             }
         }
         None
@@ -593,11 +583,8 @@ impl SymbolStore {
         let mut strings: Vec<String> = Vec::new();
 
         while let Some(symbol) = symbols.next().ok()? {
-            match symbol.parse() {
-                Ok(pdb::SymbolData::Public(data)) => {
-                    strings.push(data.name.to_string().into());
-                }
-                _ => {}
+            if let Ok(pdb::SymbolData::Public(data)) = symbol.parse() {
+                strings.push(data.name.to_string().into());
             }
         }
 
@@ -624,12 +611,11 @@ impl SymbolStore {
         while let Some(typ) = iter.next().ok()? {
             type_finder.update(&iter);
 
-            if let Ok(TypeData::Class(class)) = typ.parse() {
-                if !class.properties.forward_reference()
-                    && class.name.to_string() != "<anonymous-tag>"
-                {
-                    strings.push(class.name.to_string().into());
-                }
+            if let Ok(TypeData::Class(class)) = typ.parse()
+                && !class.properties.forward_reference()
+                && class.name.to_string() != "<anonymous-tag>"
+            {
+                strings.push(class.name.to_string().into());
             }
         }
 
@@ -702,25 +688,22 @@ impl SymbolStore {
         let max_offset = 8192u32;
 
         while let Some(symbol) = symbols.next().ok()? {
-            match symbol.parse() {
-                Ok(pdb::SymbolData::Public(data)) => {
-                    if let Some(rva) = data.offset.to_rva(&address_map) {
-                        let symbol_address = base_address + rva.0 as u64;
-                        if address.0 >= symbol_address.0 {
-                            let offset = (address.0 - symbol_address.0) as u32;
-                            if offset <= max_offset {
-                                if let Some((_, best_offset)) = closest {
-                                    if offset < best_offset {
-                                        closest = Some((data.name.to_string().into(), offset));
-                                    }
-                                } else {
-                                    closest = Some((data.name.to_string().into(), offset));
-                                }
+            if let Ok(pdb::SymbolData::Public(data)) = symbol.parse()
+                && let Some(rva) = data.offset.to_rva(&address_map)
+            {
+                let symbol_address = base_address + rva.0 as u64;
+                if address.0 >= symbol_address.0 {
+                    let offset = (address.0 - symbol_address.0) as u32;
+                    if offset <= max_offset {
+                        if let Some((_, best_offset)) = closest {
+                            if offset < best_offset {
+                                closest = Some((data.name.to_string().into(), offset));
                             }
+                        } else {
+                            closest = Some((data.name.to_string().into(), offset));
                         }
                     }
                 }
-                _ => {}
             }
         }
 
@@ -770,8 +753,8 @@ impl SymbolStore {
 
                 _ => Ok(0),
             },
-            pdb::TypeData::Class(data) => Ok(data.size as u64), // NOTE this might (probably will) return 0
-            pdb::TypeData::Union(data) => Ok(data.size as u64), // FIXME possibly? ^^
+            pdb::TypeData::Class(data) => Ok(data.size), // NOTE this might (probably will) return 0
+            pdb::TypeData::Union(data) => Ok(data.size), // FIXME possibly? ^^
             pdb::TypeData::Pointer(_) => Ok(ptr_size),
             pdb::TypeData::Modifier(data) => {
                 self.get_type_size(finder, data.underlying_type, ptr_size)
@@ -837,7 +820,7 @@ impl SymbolStore {
 
             TypeData::Array(data) => {
                 let inner = self.resolve_type(finder, data.element_type)?;
-                let count = data.dimensions.get(0).unwrap_or(&0).clone();
+                let count = data.dimensions.first().unwrap_or(&0);
                 let mut sizeof_type = self.get_type_size(finder, data.element_type, 8)? as u32;
                 if sizeof_type == 0 {
                     sizeof_type = 1;
@@ -859,19 +842,18 @@ impl SymbolStore {
 
             pdb::TypeData::Procedure(data) => {
                 let return_type = if let Some(idx) = data.return_type {
-                    let t = self.resolve_type(finder, idx)?;
-                    t
+                    self.resolve_type(finder, idx)?
                 } else {
                     ParsedType::Primitive("void".to_string())
                 };
 
                 let mut args = Vec::new();
-                if let Ok(arg_item) = finder.find(data.argument_list) {
-                    if let Ok(pdb::TypeData::ArgumentList(list)) = arg_item.parse() {
-                        for arg_idx in list.arguments {
-                            let arg_type = self.resolve_type(finder, arg_idx)?;
-                            args.push(arg_type);
-                        }
+                if let Ok(arg_item) = finder.find(data.argument_list)
+                    && let Ok(pdb::TypeData::ArgumentList(list)) = arg_item.parse()
+                {
+                    for arg_idx in list.arguments {
+                        let arg_type = self.resolve_type(finder, arg_idx)?;
+                        args.push(arg_type);
                     }
                 }
 
@@ -930,22 +912,21 @@ impl SymbolStore {
         while let Some(typ) = iter.next().ok()? {
             type_finder.update(&iter);
 
-            if let Ok(TypeData::Class(class)) = typ.parse() {
-                if class.name.to_string() == struct_name.as_ref()
-                    && !class.properties.forward_reference()
-                {
-                    let mut fields_map: HashMap<String, FieldInfo> = HashMap::new();
-                    if let Some(field_index) = class.fields {
-                        self.process_field_list(&type_finder, field_index, &mut fields_map)
-                            .ok()?;
-                    }
-
-                    return Some(TypeInfo {
-                        name: struct_name.into(),
-                        size: class.size as usize,
-                        fields: fields_map,
-                    });
+            if let Ok(TypeData::Class(class)) = typ.parse()
+                && class.name.to_string() == struct_name.as_ref()
+                && !class.properties.forward_reference()
+            {
+                let mut fields_map: HashMap<String, FieldInfo> = HashMap::new();
+                if let Some(field_index) = class.fields {
+                    self.process_field_list(&type_finder, field_index, &mut fields_map)
+                        .ok()?;
                 }
+
+                return Some(TypeInfo {
+                    name: struct_name.into(),
+                    size: class.size as usize,
+                    fields: fields_map,
+                });
             }
         }
 

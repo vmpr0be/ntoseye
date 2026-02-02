@@ -288,14 +288,7 @@ impl GdbClient {
         self.stream.write_all(&[0x03])?;
         self.stream.flush()?;
 
-        loop {
-            match self.read_packet() {
-                Ok(_pkt) => {}
-                Err(_) => {
-                    break;
-                }
-            }
-        }
+        while self.read_packet().is_ok() {}
 
         self.stream.set_read_timeout(None)?;
 
@@ -367,7 +360,7 @@ impl GdbClient {
         if response == "OK" || response.is_empty() {
             Ok(())
         } else if response.starts_with('E') {
-            Err(Error::RSP(format!(
+            Err(Error::Rsp(format!(
                 "failed to set breakpoint: {}",
                 response
             )))
@@ -381,7 +374,7 @@ impl GdbClient {
         if response == "OK" || response.is_empty() {
             Ok(())
         } else if response.starts_with('E') {
-            Err(Error::RSP(format!(
+            Err(Error::Rsp(format!(
                 "failed to remove breakpoint: {}",
                 response
             )))
@@ -394,7 +387,7 @@ impl GdbClient {
         let response = self.send_packet("g")?;
 
         if response.starts_with('E') {
-            return Err(Error::RSP(format!(
+            return Err(Error::Rsp(format!(
                 "failed to read registers: {}",
                 response
             )));
@@ -413,7 +406,7 @@ impl GdbClient {
         if response == "OK" {
             Ok(())
         } else {
-            Err(Error::RSP(format!(
+            Err(Error::Rsp(format!(
                 "failed to write registers: {}",
                 response
             )))
@@ -433,7 +426,7 @@ impl GdbClient {
             let mut buf = [0u8; 1];
             self.stream.read_exact(&mut buf)?;
             if buf[0] != b'+' {
-                return Err(Error::RSP(format!("expected ACK, got 0x{:02x}", buf[0])));
+                return Err(Error::Rsp(format!("expected ACK, got 0x{:02x}", buf[0])));
             }
         }
 
@@ -530,8 +523,7 @@ impl GdbClient {
                 break;
             }
 
-            if response.starts_with('m') {
-                let list = &response[1..];
+            if let Some(list) = response.strip_prefix('m') {
                 for id in list.split(',') {
                     if !id.is_empty() {
                         threads.push(id.to_string());
@@ -548,7 +540,7 @@ impl GdbClient {
     pub fn set_current_thread(&mut self, thread_id: &str) -> Result<()> {
         let resp_g = self.send_packet(&format!("Hg{}", thread_id))?;
         if resp_g != "OK" {
-            return Err(Error::RSP(format!(
+            return Err(Error::Rsp(format!(
                 "failed to set general thread: {}",
                 resp_g
             )));
@@ -556,7 +548,7 @@ impl GdbClient {
 
         let resp_c = self.send_packet(&format!("Hc{}", thread_id))?;
         if resp_c != "OK" {
-            return Err(Error::RSP(format!(
+            return Err(Error::Rsp(format!(
                 "failed to set control thread: {}",
                 resp_c
             )));
@@ -568,16 +560,16 @@ impl GdbClient {
     pub fn get_stopped_thread_id(&mut self) -> Result<String> {
         let response = self.send_packet("?")?;
 
-        if response.starts_with('T') {
-            if let Some(start) = response.find("thread:") {
-                let remainder = &response[start + 7..];
-                if let Some(end) = remainder.find(';') {
-                    return Ok(remainder[0..end].to_string());
-                }
+        if response.starts_with('T')
+            && let Some(start) = response.find("thread:")
+        {
+            let remainder = &response[start + 7..];
+            if let Some(end) = remainder.find(';') {
+                return Ok(remainder[0..end].to_string());
             }
         }
 
-        Err(Error::RSP(
+        Err(Error::Rsp(
             "could not determine thread from stop reply".into(),
         ))
     }
@@ -602,7 +594,7 @@ impl GdbClient {
                 "l" => break,    // last chunk
                 "m" => continue, // more data
                 _ => {
-                    return Err(Error::RSP(format!(
+                    return Err(Error::Rsp(format!(
                         "unexpected qXfer response: {}",
                         response
                     )));
@@ -660,7 +652,7 @@ impl GdbClient {
                 "l" => break,
                 "m" => continue,
                 _ => {
-                    return Err(Error::RSP(format!(
+                    return Err(Error::Rsp(format!(
                         "unexpected qXfer response for {}: {}",
                         filename, response
                     )));

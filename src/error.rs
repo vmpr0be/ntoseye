@@ -35,7 +35,7 @@ pub enum Error {
     CtrlC(#[from] ctrlc::Error),
 
     #[error("GDB protocol failure: {0}")]
-    RSP(String),
+    Rsp(String),
 
     #[error("Register '{0}' not found")]
     RegisterNotFound(String),

@@ -1,7 +1,6 @@
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
-    gdb::GdbClient,
     host::KvmHandle,
     memory::{self, PAGE_SIZE},
     symbols::{SymbolStore, TypeInfo},
@@ -173,7 +172,7 @@ impl WinObject {
 
     // TODO binary should probably be reread to ensure correctness
     // TODO bc shared memory might/isnt used, this needs to be mutable to ensure data is fresh :/
-    pub fn view<'a, B: MemoryOps<PhysAddr>>(&mut self, backend: &'a B) -> Option<PeView<'_>> {
+    pub fn view<B: MemoryOps<PhysAddr>>(&mut self, backend: &B) -> Option<PeView<'_>> {
         if self.binary_snapshot.is_empty() {
             let memory = self.memory(backend);
             self.binary_snapshot = read_pe_image(self.base_address, &memory).ok()?;
@@ -199,7 +198,9 @@ pub struct Guest {
 }
 
 pub struct Translation {
+    #[allow(dead_code)]
     address: PhysAddr,
+    #[allow(dead_code)]
     large: bool,
     writable: bool,
     user: bool,
@@ -309,7 +310,6 @@ fn is_valid_kernel_dtb(kvm: &KvmHandle, dtb: Dtb) -> Result<bool> {
 fn find_kernel_dtb(kvm: &KvmHandle) -> Result<Option<Dtb>> {
     for dtb in (0x1000..0x1000000).step_by(PAGE_SIZE) {
         if is_valid_kernel_dtb(kvm, dtb)? {
-            println!("kernel_dtb: {dtb:x}");
             return Ok(Some(dtb));
         }
     }

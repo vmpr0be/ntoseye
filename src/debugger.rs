@@ -271,13 +271,13 @@ impl DebuggerContext {
             value: pte_value,
         };
 
-        return Ok(DebuggerPteTraversal {
+        Ok(DebuggerPteTraversal {
             address,
             pxe,
             ppe,
             pde: Some(pde),
             pte: Some(pte),
-        });
+        })
     }
 }
 
@@ -286,9 +286,10 @@ impl fmt::Display for DebuggerPte {
         let flags = format!("pfn {:<5x} {:>11}", self.value.pfn(), self.value.flags());
         write!(
             f,
-            "{}\n{}\n{}",
-            format!("{} at {:X}", self.name, self.address),
-            format!("contains {:016X}", Value(self.value.0)),
+            "{} at {:X}\ncontains {:016X}\n{}",
+            self.name,
+            self.address,
+            Value(self.value.0),
             flags
         )
     }

@@ -63,14 +63,12 @@ fn get_kvm_pid() -> Result<i32> {
                 Err(_) => continue,
             };
 
-            if let Ok(target) = fs::read_link(fd_entry.path()) {
-                if target == PathBuf::from("/dev/kvm") {
-                    if let Some(pid_str) = entry.file_name().to_str() {
-                        if let Ok(pid) = pid_str.parse::<i32>() {
-                            return Ok(pid);
-                        }
-                    }
-                }
+            if let Ok(target) = fs::read_link(fd_entry.path())
+                && target == PathBuf::from("/dev/kvm")
+                && let Some(pid_str) = entry.file_name().to_str()
+                && let Ok(pid) = pid_str.parse::<i32>()
+            {
+                return Ok(pid);
             }
         }
     }
@@ -153,7 +151,7 @@ impl MemoryOps<PhysAddr> for KvmHandle {
 
         let local_iov = IoSlice::new(buf);
 
-        let bytes_read = process_vm_writev(self.pid, &mut [local_iov], &[remote_iov])?;
+        let bytes_read = process_vm_writev(self.pid, &[local_iov], &[remote_iov])?;
         Ok(bytes_read)
     }
 }
