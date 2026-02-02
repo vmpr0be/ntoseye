@@ -8,6 +8,7 @@ use crate::{
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use pelite::pe64::{Pe, PeView};
+use rayon::prelude::*;
 use zerocopy::{FromBytes, IntoBytes};
 
 /// used for enumeration without loading full WinObject
@@ -388,7 +389,15 @@ fn scan_small_pages(
         }
 
         let next_table = pte.pte_frame_addr();
-        scan_small_pages(kvm, next_table, va_current, va_min, va_max, level - 1, candidates);
+        scan_small_pages(
+            kvm,
+            next_table,
+            va_current,
+            va_min,
+            va_max,
+            level - 1,
+            candidates,
+        );
     }
 }
 
@@ -449,11 +458,22 @@ fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject, String> {
         }
 
         let mut candidates = std::collections::BTreeSet::new();
-        scan_small_pages(kvm, pa_dtb, 0, KERNEL_VA_MIN, KERNEL_VA_MAX, 4, &mut candidates);
+        scan_small_pages(
+            kvm,
+            pa_dtb,
+            0,
+            KERNEL_VA_MIN,
+            KERNEL_VA_MAX,
+            4,
+            &mut candidates,
+        );
 
         for va in candidates {
             let mut page_buf = [0u8; 0x1000];
-            if kernel_space.read_bytes(VirtAddr(va), &mut page_buf).is_err() {
+            if kernel_space
+                .read_bytes(VirtAddr(va), &mut page_buf)
+                .is_err()
+            {
                 continue;
             }
 
@@ -1040,11 +1060,11 @@ impl Guest {
                     .progress_chars("#-"),
             );
 
-            for (job, guid, module) in already_loaded.iter().chain(jobs_with_info.iter()) {
+            for (job, guid, module) in already_loaded.into_iter().chain(jobs_with_info.into_iter()) {
                 if symbols
                     .load_downloaded_pdb(
-                        job,
-                        *guid,
+                        &job,
+                        guid,
                         &module.name,
                         module.base_address,
                         module.size,

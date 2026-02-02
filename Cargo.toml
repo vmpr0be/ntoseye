@@ -30,6 +30,7 @@ strum = "0.27.2"
 strum_macros = "0.27.2"
 tabled = { version = "0.20.0", features = [ "ansi" ] }
 zerocopy = { version = "0.8.31", features = [ "derive" ] }
+rayon = "1.11.0"
 
 # The profile that 'dist' will build with
 [profile.dist]
