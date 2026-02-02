@@ -3,7 +3,14 @@ use crate::error::{Error, Result};
 use crate::types::*;
 
 // PageFrameNumber
-const PMASK: u64 = (!0xFu64 << 8) & 0xFFFFFFFFFu64;
+pub const PFN_MASK: u64 = (!0xFu64 << 8) & 0xFFFFFFFFFu64;
+pub const PAGE_SIZE: usize = 0x1000; // 4KiB
+pub const PAGE_SHIFT: u32 = 12;
+pub const PTE_SHIFT: u8 = 12;
+pub const PDE_SHIFT: u8 = 21;
+pub const PDPTE_SHIFT: u8 = 30;
+pub const PML4E_SHIFT: u8 = 39;
+pub const PT_INDEX_MASK: u64 = 0x1FF;
 
 // 'a = lifetime of the borrow of the backend
 //  B = any type that implements phys mem
@@ -20,55 +27,45 @@ pub enum PteLevel {
     Pml4e,
 }
 
-pub const fn sign_extend_48bit(address: u64) -> u64 {
-    if address & 0x0000_8000_0000_0000 != 0 {
-        address | 0xffff_0000_0000_0000
-    } else {
-        address
-    }
-}
-
 impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
     pub fn new(backend: &'a B, dtb: Dtb) -> Self {
         Self { backend, dtb }
     }
 
-    fn read_entry(&self, table_base: PhysAddr, index: u64) -> Result<PageTableEntry> {
-        self.backend.read(table_base + 8 * index)
+    fn read_pt_entry(&self, table_base: PhysAddr, index: usize) -> Result<PageTableEntry> {
+        self.backend.read(table_base + 8 * index as u64)
     }
 
-    // TODO lots of bad casting here, needs to be rewritten
     pub fn virt_to_phys(&self, vaddr: VirtAddr) -> Result<PhysAddr> {
-        let pml4e = self.read_entry(self.dtb, vaddr.pml4e_index())?;
+        let pml4e = self.read_pt_entry(self.dtb, vaddr.pml4_index())?;
         if !pml4e.is_present() {
             return Err(Error::PTEntryNotPresent(PteLevel::Pml4e));
         }
 
-        let pdpte = self.read_entry(pml4e.0 & PMASK, vaddr.pdpte_index())?;
+        let pdpte = self.read_pt_entry(pml4e.page_frame(), vaddr.pdpt_index())?;
         if !pdpte.is_present() {
             return Err(Error::PTEntryNotPresent(PteLevel::Pdpte));
         }
 
         if pdpte.is_large_page() {
-            return Ok((pdpte.0 & (!0u64 << 42 >> 12)) + (vaddr.0 & !(!0u64 << 30)));
+            return Ok(pdpte.page_frame() + vaddr.huge_page_offset());
         }
 
-        let pde = self.read_entry(pdpte.0 & PMASK, vaddr.pde_index())?;
+        let pde = self.read_pt_entry(pdpte.page_frame(), vaddr.pd_index())?;
         if !pde.is_present() {
             return Err(Error::PTEntryNotPresent(PteLevel::Pde));
         }
 
         if pde.is_large_page() {
-            return Ok((pde.0 & PMASK) + (vaddr.0 & !(!0u64 << 21)));
+            return Ok(pde.page_frame() + vaddr.large_page_offset());
         }
 
-        let pte = self.read_entry(pde.0 & PMASK, vaddr.pte_index())?;
-        let paddr = pte.0 & PMASK;
-        if paddr == 0 {
+        let pte = self.read_pt_entry(pde.page_frame(), vaddr.pt_index())?;
+        if !pte.is_present() {
             return Err(Error::PTEntryNotPresent(PteLevel::Pte));
         }
 
-        Ok(paddr + vaddr.page_offset())
+        Ok(pte.page_frame() + vaddr.page_offset())
     }
 }
 

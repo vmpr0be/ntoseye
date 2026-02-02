@@ -1,14 +1,15 @@
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
+    gdb::GdbClient,
     host::KvmHandle,
-    memory::{self},
+    memory::{self, PAGE_SIZE},
     symbols::{SymbolStore, TypeInfo},
     types::*,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use pelite::pe64::{Pe, PeView};
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::IntoBytes;
 
 /// used for enumeration without loading full WinObject
 #[derive(Debug, Clone)]
@@ -197,307 +198,232 @@ pub struct Guest {
     pub ntoskrnl: WinObject,
 }
 
-fn verify_pml4(page: &[u8; 0x1000], pa: u64) -> bool {
-    let ptes: &[PageTableEntry] = FromBytes::ref_from_bytes(page).unwrap();
-
-    // usermode PTEs
-    let user_zero = ptes.iter().take(256).filter(|&&x| x.is_zero()).count();
-
-    // kernelmode PTEs
-    let (mut kernel_zero, mut kernel_valid, mut self_ref) = (0, 0, false);
-    for &pte in &ptes[256..512] {
-        if pte.is_zero() {
-            kernel_zero += 1;
-            continue;
-        }
-
-        // supervisor entry
-        if pte.is_kernel_table() {
-            let pdpt_pa = pte.pte_frame_addr();
-            if pdpt_pa < 0x10000000000 {
-                kernel_valid += 1;
-            }
-        }
-
-        self_ref |= pte.is_self_ref(pa);
-    }
-
-    self_ref && kernel_valid >= 6 && user_zero > 0x40 && kernel_zero > 0x40
+pub struct Translation {
+    address: PhysAddr,
+    large: bool,
+    writable: bool,
+    user: bool,
+    nx: bool,
 }
 
-const PML_REGION_SIZE: [u64; 5] = [0, 12, 21, 30, 39];
-
-// TODO i dont think u64 should be used here
-fn scan_large_pages(
-    kvm: &KvmHandle,
-    pa_table: u64,
-    va_base: u64,
-    va_min: u64,
-    va_max: u64,
-    level: usize,
-    out_va_base: &mut u64,
-    out_size: &mut u64,
-) -> bool {
-    if level < 2 {
-        return false;
-    }
-
-    let page: [u8; 0x1000] = match kvm.read(pa_table) {
-        Ok(page) => page,
-        Err(_) => return false,
-    };
-
-    if level == 4 {
-        if !verify_pml4(&page, pa_table) {
-            return false;
+impl Translation {
+    pub const fn new_huge(pml4e: PageTableEntry, pdpte: PageTableEntry, va: VirtAddr) -> Self {
+        Self {
+            address: pdpte.page_frame() + va.huge_page_offset(),
+            large: true,
+            writable: pml4e.is_writable() && pdpte.is_writable(),
+            user: pml4e.is_user() && pdpte.is_user(),
+            nx: pml4e.is_nx() || pdpte.is_nx(),
         }
     }
 
-    let ptes: &[PageTableEntry] = FromBytes::ref_from_bytes(&page).unwrap();
-
-    for (i, pte) in ptes.iter().enumerate() {
-        let va_current = memory::sign_extend_48bit((i << PML_REGION_SIZE[level]) as u64 + va_base);
-
-        if *out_va_base != 0 && (va_current > (*out_va_base + *out_size)) {
-            return *out_size > 0;
-        }
-
-        if va_current < va_min {
-            continue;
-        }
-
-        if va_current > va_max {
-            return *out_size > 0;
-        }
-
-        if !pte.is_present() {
-            continue;
-        }
-
-        if level == 2 {
-            if !pte.is_large_page() {
-                continue;
-            }
-
-            if *out_va_base == 0 {
-                *out_va_base = va_current;
-            }
-
-            *out_size += 0x200000; // 2 MiB
-        }
-
-        if pte.is_large_page() {
-            continue;
-        }
-
-        let next_table = pte.pte_frame_addr();
-        if scan_large_pages(
-            kvm,
-            next_table,
-            va_current,
-            va_min,
-            va_max,
-            level - 1,
-            out_va_base,
-            out_size,
-        ) {
-            return true;
+    pub const fn new_large(
+        pml4e: PageTableEntry,
+        pdpte: PageTableEntry,
+        pde: PageTableEntry,
+        va: VirtAddr,
+    ) -> Self {
+        Self {
+            address: pde.page_frame() + va.large_page_offset(),
+            large: true,
+            writable: pml4e.is_writable() && pdpte.is_writable() && pdpte.is_user(),
+            user: pml4e.is_user() && pdpte.is_user() && pde.is_user(),
+            nx: pml4e.is_nx() || pdpte.is_nx() || pde.is_nx(),
         }
     }
 
-    false
-}
-
-fn scan_small_pages(
-    kvm: &KvmHandle,
-    pa_table: u64,
-    va_base: u64,
-    va_min: u64,
-    va_max: u64,
-    level: usize,
-    candidates: &mut std::collections::BTreeSet<u64>,
-) {
-    if level == 0 {
-        return;
-    }
-
-    let page: [u8; 0x1000] = match kvm.read(pa_table) {
-        Ok(page) => page,
-        Err(_) => return,
-    };
-
-    let va_base = if level == 4 {
-        if !verify_pml4(&page, pa_table) {
-            return;
+    pub const fn new(
+        pml4e: PageTableEntry,
+        pdpte: PageTableEntry,
+        pde: PageTableEntry,
+        pte: PageTableEntry,
+        va: VirtAddr,
+    ) -> Self {
+        Self {
+            address: pte.page_frame() + va.page_offset(),
+            large: false,
+            writable: pml4e.is_writable()
+                && pdpte.is_writable()
+                && pde.is_writable()
+                && pte.is_writable(),
+            user: pml4e.is_user() && pdpte.is_user() && pde.is_user() && pte.is_user(),
+            nx: pml4e.is_nx() || pdpte.is_nx() || pde.is_nx() || pte.is_nx(),
         }
-        0
-    } else {
-        va_base
-    };
-
-    let ptes: &[PageTableEntry] = FromBytes::ref_from_bytes(&page).unwrap();
-
-    for i in 0..512 {
-        let va_current =
-            memory::sign_extend_48bit(va_base + ((i as u64) << PML_REGION_SIZE[level]));
-
-        if va_current < va_min {
-            continue;
-        }
-        if va_current > va_max {
-            return;
-        }
-
-        let pte = ptes[i];
-        if !pte.is_present() {
-            continue;
-        }
-
-        if level == 1 {
-            // Look for the ntoskrnl small page pattern:
-            // page i-1 is empty
-            // page i is ACTIVE-WRITE-SUPERVISOR-NOEXECUTE 0x8000000000000003
-            // pages i+1 to i+31 are ACTIVE-SUPERVISOR 0x01
-
-            if i == 0 {
-                continue;
-            }
-            if !ptes[i - 1].is_zero() {
-                continue;
-            }
-            if (pte.0 & 0x800000000000000f) != 0x8000000000000003 {
-                continue;
-            }
-
-            let mut valid = true;
-            for j in (i + 2)..std::cmp::min(i + 32, 512) {
-                if (ptes[j].0 & 0x0f) != 0x01 {
-                    valid = false;
-                    break;
-                }
-            }
-
-            if valid {
-                candidates.insert(va_current);
-            }
-            continue;
-        }
-
-        if pte.is_large_page() {
-            continue;
-        }
-
-        let next_table = pte.pte_frame_addr();
-        scan_small_pages(
-            kvm,
-            next_table,
-            va_current,
-            va_min,
-            va_max,
-            level - 1,
-            candidates,
-        );
     }
 }
 
-fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject> {
-    const KERNEL_VA_MIN: u64 = 0xfffff80000000000;
-    const KERNEL_VA_MAX: u64 = 0xfffff807ffffffff;
+fn translate_virt2phys(kvm: &KvmHandle, dtb: Dtb, va: VirtAddr) -> Result<Option<Translation>> {
+    let pml4e = kvm.read::<PageTableEntry>(dtb + va.pml4_index() as u64 * 8)?;
+    if !pml4e.is_present() {
+        return Ok(None);
+    }
 
-    for pa_dtb in (0x1000u64..0x1000000).step_by(0x1000) {
-        let page: [u8; 0x1000] = match kvm.read(pa_dtb) {
-            Ok(page) => page,
-            Err(_) => continue,
+    let pdpte = kvm.read::<PageTableEntry>(pml4e.page_frame() + va.pdpt_index() as u64 * 8)?;
+    if !pdpte.is_present() {
+        return Ok(None);
+    }
+
+    if pdpte.is_large_page() {
+        return Ok(Some(Translation::new_huge(pml4e, pdpte, va)));
+    }
+
+    let pde = kvm.read::<PageTableEntry>(pdpte.page_frame() + va.pd_index() as u64 * 8)?;
+    if !pde.is_present() {
+        return Ok(None);
+    }
+
+    if pde.is_large_page() {
+        return Ok(Some(Translation::new_large(pml4e, pdpte, pde, va)));
+    }
+
+    let pte = kvm.read::<PageTableEntry>(pde.page_frame() + va.pt_index() as u64 * 8)?;
+    if !pte.is_present() {
+        return Ok(None);
+    }
+
+    Ok(Some(Translation::new(pml4e, pdpte, pde, pte, va)))
+}
+
+fn is_valid_kernel_dtb(kvm: &KvmHandle, dtb: Dtb) -> Result<bool> {
+    let kernel_pml4 = kvm.read::<[PageTableEntry; 256]>(dtb + 8 * 256)?;
+
+    if kernel_pml4
+        .into_iter()
+        .filter(|e| e.page_frame() == dtb)
+        .count()
+        != 1
+    {
+        return Ok(false);
+    }
+
+    // Check if use KUSER_SHARED_DATA is mapped
+    const KUSER_SHARED_DATA_VA: VirtAddr = VirtAddr::from_u64(0xfffff78000000000);
+
+    let Some(xlat) = translate_virt2phys(kvm, dtb, KUSER_SHARED_DATA_VA)? else {
+        return Ok(false);
+    };
+
+    Ok(!xlat.writable && !xlat.user && xlat.nx)
+}
+
+fn find_kernel_dtb(kvm: &KvmHandle) -> Result<Option<Dtb>> {
+    for dtb in (0x1000..0x1000000).step_by(PAGE_SIZE) {
+        if is_valid_kernel_dtb(kvm, dtb)? {
+            println!("kernel_dtb: {dtb:x}");
+            return Ok(Some(dtb));
+        }
+    }
+
+    Ok(None)
+}
+
+fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>> {
+    const KERNEL_VA_MIN: VirtAddr = VirtAddr::from_u64(0xfffff80000000000);
+    const KERNEL_VA_MAX: VirtAddr = VirtAddr::from_u64(0xfffff80800000000);
+
+    let pml4e_count = KERNEL_VA_MAX.pml4_index() - KERNEL_VA_MIN.pml4_index() + 1;
+
+    let kernel_pml4 = kvm.read::<[PageTableEntry; 512]>(kernel_dtb)?;
+    for (pml4_index, pml4e) in kernel_pml4
+        .into_iter()
+        .enumerate()
+        .skip(KERNEL_VA_MIN.pml4_index())
+        .take(pml4e_count)
+    {
+        if !pml4e.is_present() {
+            continue;
+        }
+        let pdpt = kvm.read::<[PageTableEntry; 512]>(pml4e.page_frame())?;
+
+        let pdpte_count = if pml4_index == pml4e_count - 1 {
+            KERNEL_VA_MAX.pdpt_index() + 1
+        } else {
+            512
         };
 
-        if !verify_pml4(&page, pa_dtb) {
-            continue;
-        }
+        for (pdpt_index, pdpte) in pdpt.into_iter().take(pdpte_count).enumerate() {
+            if !pdpte.is_present() {
+                continue;
+            }
 
-        let mut kernel_base = 0u64;
-        let mut kernel_size = 0u64;
+            if pdpte.is_large_page() {
+                continue;
+            }
 
-        let kernel_space = memory::AddressSpace::new(kvm, pa_dtb);
+            let pd = kvm.read::<[PageTableEntry; 512]>(pdpte.page_frame())?;
 
-        if scan_large_pages(
-            &kvm,
-            pa_dtb,
-            0,
-            KERNEL_VA_MIN,
-            KERNEL_VA_MAX,
-            4,
-            &mut kernel_base,
-            &mut kernel_size,
-        ) {
-            if kernel_size >= 0x400000 && kernel_size < 0x1800000 {
-                let mut kernel = vec![0u8; kernel_size as usize];
+            let pde_count = if pdpt_index == pdpte_count - 1 {
+                KERNEL_VA_MAX.pd_index() + 1
+            } else {
+                512
+            };
 
-                if let Err(_) = kernel_space.read_bytes(VirtAddr(kernel_base), &mut kernel) {
+            for (pd_index, pde) in pd.into_iter().take(pde_count).enumerate() {
+                if !pde.is_present() {
                     continue;
                 }
 
-                for p in (0usize..kernel_size as usize).step_by(0x1000) {
-                    let header = u16::read_from_bytes(&kernel[p..p + 2]).unwrap();
-                    if header != 0x5a4d {
-                        // MZ
+                if pde.is_large_page() {
+                    continue;
+                }
+
+                let pt = kvm.read::<[PageTableEntry; 512]>(pde.page_frame())?;
+
+                let pte_count = if pd_index == pde_count - 1 {
+                    KERNEL_VA_MAX.pt_index() + 1
+                } else {
+                    512
+                };
+
+                for (pt_index, pte) in pt.into_iter().take(pte_count).enumerate() {
+                    if !pte.is_present() {
                         continue;
                     }
 
-                    for o in (0usize..0x1000).step_by(8) {
-                        let poolcode = u64::read_from_bytes(&kernel[(p + o)..(p + o + 8)]).unwrap();
-                        if poolcode == 0x45444F434C4F4F50u64 {
-                            return Ok(WinObject::new(pa_dtb, VirtAddr(kernel_base + p as u64)));
+                    if pte.is_writable() && !pte.is_user() && pte.is_nx() {
+                        let phys = pte.page_frame();
+                        let header = kvm.read::<[u8; 0x1000]>(phys)?;
+
+                        if header[..4] != [0x4d, 0x5a, 0x90, 0x00] {
+                            continue;
+                        }
+
+                        for chunk in header.chunks_exact(8) {
+                            if chunk == b"POOLCODE" {
+                                let va =
+                                    VirtAddr::construct(pml4_index, pdpt_index, pd_index, pt_index);
+                                return Ok(Some(va));
+                            }
                         }
                     }
                 }
             }
         }
-
-        let mut candidates = std::collections::BTreeSet::new();
-        scan_small_pages(
-            kvm,
-            pa_dtb,
-            0,
-            KERNEL_VA_MIN,
-            KERNEL_VA_MAX,
-            4,
-            &mut candidates,
-        );
-
-        for va in candidates {
-            let mut page_buf = [0u8; 0x1000];
-            if kernel_space
-                .read_bytes(VirtAddr(va), &mut page_buf)
-                .is_err()
-            {
-                continue;
-            }
-
-            // MZ
-            let header = u16::read_from_bytes(&page_buf[0..2]).unwrap();
-            if header != 0x5a4d {
-                continue;
-            }
-
-            // POOLCODE signature
-            for o in (0usize..0x1000).step_by(8) {
-                let poolcode = u64::read_from_bytes(&page_buf[o..o + 8]).unwrap();
-                if poolcode == 0x45444F434C4F4F50u64 {
-                    return Ok(WinObject::new(pa_dtb, VirtAddr(va)));
-                }
-            }
-        }
-
-        break;
     }
 
-    Err(Error::NtoskrnlNotFound)
+    Ok(None)
+}
+
+fn find_ntoskrnl(kvm: &KvmHandle) -> Result<Option<WinObject>> {
+    let Some(kernel_dtb) = find_kernel_dtb(kvm)? else {
+        return Ok(None);
+    };
+
+    let Some(ntoskrnl_va) = find_ntoskrnl_va(kernel_dtb, kvm)? else {
+        return Ok(None);
+    };
+
+    let ntoskrnl = WinObject::new(kernel_dtb, ntoskrnl_va);
+    Ok(Some(ntoskrnl))
 }
 
 impl Guest {
     // TODO (everywhere) use MemoryOps, not KvmHandle...
     pub fn new(kvm: &KvmHandle, symbols: &mut SymbolStore) -> Result<Self> {
-        let ntoskrnl = get_ntoskrnl_winobj(kvm)?.load_symbols(kvm, symbols)?;
+        let ntoskrnl = find_ntoskrnl(kvm)?
+            .ok_or(Error::NtoskrnlNotFound)?
+            .load_symbols(kvm, symbols)?;
+
         Ok(Self { ntoskrnl })
     }
 
@@ -652,7 +578,7 @@ impl Guest {
                 // Read UNICODE_STRING for BaseDllName
                 let name_length: u16 = process_memory.read(entry_base + base_dll_name_offset)?;
                 let name_buffer: VirtAddr =
-                    process_memory.read(entry_base + base_dll_name_offset + 8)?;
+                    process_memory.read(entry_base + base_dll_name_offset + 8u32)?;
 
                 if name_length > 0 && name_buffer.0 != 0 && name_length < 520 {
                     let mut name_buf = vec![0u8; name_length as usize];
@@ -762,7 +688,7 @@ impl Guest {
             // Read UNICODE_STRING for BaseDllName
             let name_length: u16 = process_memory.read(entry_base + base_dll_name_offset)?;
             let name_buffer: VirtAddr =
-                process_memory.read(entry_base + base_dll_name_offset + 8)?;
+                process_memory.read(entry_base + base_dll_name_offset + 8u32)?;
 
             let name = if name_length > 0 && name_buffer.0 != 0 {
                 let mut name_buf = vec![0u8; name_length as usize];
@@ -840,7 +766,7 @@ impl Guest {
 
             // Read UNICODE_STRING for BaseDllName
             let name_length: u16 = memory.read(entry_base + base_dll_name_offset)?;
-            let name_buffer: VirtAddr = memory.read(entry_base + base_dll_name_offset + 8)?;
+            let name_buffer: VirtAddr = memory.read(entry_base + base_dll_name_offset + 8u32)?;
 
             let name = if name_length > 0 && name_buffer.0 != 0 {
                 let mut name_buf = vec![0u8; name_length as usize];

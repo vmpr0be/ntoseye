@@ -1167,21 +1167,21 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                                 ParsedType::Primitive(p) => {
                                                     if p.contains("*") || p.contains("LONGLONG") {
                                                         let val: u64 =
-                                                            mem.read(address + info.offset.into())?;
+                                                            mem.read(address + info.offset)?;
                                                         format!(" = {:#x}", Value(val))
                                                     } else if p.contains("LONG") {
                                                         let val: u32 =
-                                                            mem.read(address + info.offset.into())?;
+                                                            mem.read(address + info.offset)?;
                                                         format!(" = {:#x}", Value(val))
                                                     } else if p.contains("SHORT")
                                                         || p.contains("WCHAR")
                                                     {
                                                         let val: u16 =
-                                                            mem.read(address + info.offset.into())?;
+                                                            mem.read(address + info.offset)?;
                                                         format!(" = {:#x}", Value(val))
                                                     } else if p.contains("CHAR") {
                                                         let val: u8 =
-                                                            mem.read(address + info.offset.into())?;
+                                                            mem.read(address + info.offset)?;
                                                         format!(" = {:#x}", Value(val))
                                                     } else {
                                                         "".into()
@@ -1189,12 +1189,12 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                                 }
                                                 ParsedType::Pointer(_) => {
                                                     let val: u64 =
-                                                        mem.read(address + info.offset.into())?;
+                                                        mem.read(address + info.offset)?;
                                                     format!(" = {:#x}", Value(val))
                                                 }
                                                 ParsedType::Bitfield { pos, len, .. } => {
                                                     let val: u64 =
-                                                        mem.read(address + info.offset.into())?;
+                                                        mem.read(address + info.offset)?;
                                                     let val = (val >> pos) & ((1u64 << len) - 1);
 
                                                     if *len == 1 {

@@ -705,7 +705,7 @@ impl SymbolStore {
             match symbol.parse() {
                 Ok(pdb::SymbolData::Public(data)) => {
                     if let Some(rva) = data.offset.to_rva(&address_map) {
-                        let symbol_address = base_address + rva.0.into();
+                        let symbol_address = base_address + rva.0 as u64;
                         if address.0 >= symbol_address.0 {
                             let offset = (address.0 - symbol_address.0) as u32;
                             if offset <= max_offset {
