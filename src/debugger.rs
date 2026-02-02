@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::{
     backend::MemoryOps,
+    error::{Error, Result},
     guest::{Guest, ProcessInfo, WinObject},
     host::KvmHandle,
     symbols::SymbolStore,
@@ -88,7 +89,7 @@ impl DebuggerArgument {
         !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
     }
 
-    pub fn resolve(&self, context: &DebuggerContext) -> Result<VirtAddr, String> {
+    pub fn try_resolve(&self, context: &DebuggerContext) -> Result<VirtAddr> {
         match &self.value {
             DebuggerArgumentValue::Address(addr) => {
                 if !self.deref {
@@ -103,7 +104,8 @@ impl DebuggerArgument {
                 let addr = context
                     .symbols
                     .find_symbol_across_modules(context.current_dtb(), sym)
-                    .ok_or(format!("symbol `{}` not found", sym))?;
+                    .ok_or(Error::SymbolNotFound(sym.clone()))?;
+
                 if !self.deref {
                     Ok(addr)
                 } else {
@@ -117,7 +119,7 @@ impl DebuggerArgument {
 }
 
 impl DebuggerContext {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self> {
         let kvm = KvmHandle::new()?;
         let mut symbols = SymbolStore::new();
         let guest = Guest::new(&kvm, &mut symbols)?;
@@ -141,12 +143,12 @@ impl DebuggerContext {
         }
     }
 
-    pub fn attach(&mut self, pid: u64) -> Result<String, String> {
+    pub fn attach(&mut self, pid: u64) -> Result<String> {
         let processes = self.guest.enumerate_processes(&self.kvm, &self.symbols)?;
         let process_info = processes
             .iter()
             .find(|p| p.pid == pid)
-            .ok_or(format!("process with PID {} not found", pid))?
+            .ok_or(Error::ProcessNotFound(pid))?
             .clone();
 
         let name = process_info.name.clone();
@@ -184,7 +186,7 @@ impl DebuggerContext {
         self.symbols.merged_types_index(Some(self.current_dtb()))
     }
 
-    pub fn get_startup_message_data(&mut self) -> Result<DebuggerStartupMessage, String> {
+    pub fn get_startup_message_data(&mut self) -> Result<DebuggerStartupMessage> {
         let build_number = self
             .guest
             .ntoskrnl
@@ -204,8 +206,8 @@ impl DebuggerContext {
         })
     }
 
-    pub fn pte_traverse(&self, address: DebuggerArgument) -> Result<DebuggerPteTraversal, String> {
-        let address = address.resolve(self)?;
+    pub fn pte_traverse(&self, address: DebuggerArgument) -> Result<DebuggerPteTraversal> {
+        let address = address.try_resolve(self)?;
         let process = &self.guest.ntoskrnl;
         let memory = process.memory(&self.kvm);
 
@@ -219,12 +221,8 @@ impl DebuggerContext {
         let pxe_address = VirtAddr(pxe_base.0 + (((address.0 >> 39) & 0x1FF) << 3));
         let ppe_address = VirtAddr((((address.0 & 0xFFFFFFFFFFFF) >> 30) << 3) + ppe_base.0);
 
-        let pxe_value: PageTableEntry = memory
-            .read(pxe_address)
-            .map_err(|e| format!("bad virtual address ({})", e))?;
-        let ppe_value: PageTableEntry = memory
-            .read(ppe_address)
-            .map_err(|e| format!("bad pxe? ({})", e))?;
+        let pxe_value: PageTableEntry = memory.read(pxe_address)?;
+        let ppe_value: PageTableEntry = memory.read(ppe_address)?;
 
         let pxe = DebuggerPte {
             name: "PXE".into(),

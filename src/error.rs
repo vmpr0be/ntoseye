@@ -1,0 +1,111 @@
+use std::path::PathBuf;
+
+use thiserror::Error;
+
+use crate::{memory::PteLevel, types::VirtAddr};
+
+#[derive(Debug, Error)]
+pub enum Error {
+    // Handle crate errors
+    #[error(transparent)]
+    Nix(#[from] nix::Error),
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    Pdb(#[from] pdb::Error),
+
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+
+    #[error(transparent)]
+    PeLite(#[from] pelite::Error),
+
+    #[error(transparent)]
+    ParseInt(#[from] core::num::ParseIntError),
+
+    #[error(transparent)]
+    Hex(#[from] hex::FromHexError),
+
+    #[error(transparent)]
+    Indicatif(#[from] indicatif::style::TemplateError),
+
+    #[error(transparent)]
+    CtrlC(#[from] ctrlc::Error),
+
+    #[error("GDB protocol failure: {0}")]
+    RSP(String),
+
+    #[error("Register '{0}' not found")]
+    RegisterNotFound(String),
+
+    #[error("Breakpoint '{0}' not found")]
+    BPNotFound(u32),
+
+    #[error("Not supported")]
+    NotSupported,
+
+    // Handle other errors
+    #[error("PDB file not found for {0:?}")]
+    PdbNotFound(PathBuf),
+
+    #[error("Ntoskrnl not found")]
+    NtoskrnlNotFound,
+
+    #[error("PE view failed")]
+    ViewFailed,
+
+    #[error("Storage directory wasn't found")]
+    StorageNotFound,
+
+    #[error("Symbol '{0}' not found")]
+    SymbolNotFound(String),
+
+    #[error("No symbol found near {0:x}")]
+    UnknownAddress(VirtAddr),
+
+    #[error("Process '{0}' not found")]
+    ProcessNotFound(u64),
+
+    #[error("Structure '{0}' not found")]
+    StructNotFound(String),
+
+    #[error("Field '{0}' not found")]
+    FieldNotFound(String),
+
+    #[error("Expected loaded symbols")]
+    ExpectedSymbols,
+
+    #[error("Process missing PEB (kernel process?)")]
+    MissingPEB,
+
+    #[error("Process missing LDR")]
+    MissingLDR,
+
+    #[error("Process missing ImageBase")]
+    MissingImageBase,
+
+    #[error("Process image not found")]
+    MissingImage,
+
+    #[error("No memory regions found in kvm")]
+    NoKvmRegions,
+
+    #[error("KVM process not found")]
+    KvmNotFound,
+
+    #[error("Another instance of ntoseye is running")]
+    AlreadyRunning,
+
+    #[error("Page table entry not present at level '{0:?}'")]
+    PTEntryNotPresent(PteLevel),
+
+    #[error("Data doesn't find in buffer")]
+    BufferNotEnough,
+
+    #[error("Invalid range")]
+    InvalidRange,
+}
+
+pub type Result<T> = std::result::Result<T, Error>;

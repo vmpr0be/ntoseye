@@ -8,14 +8,18 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 #[derive(Clone, Copy, Debug, PartialEq, FromBytes, IntoBytes, Immutable)]
 pub struct VirtAddr(pub u64);
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PhysAddr(pub u64);
+pub type PhysAddr = u64;
 
-#[derive(Clone, Copy, Debug)]
-pub struct Dtb(pub PhysAddr);
+pub type Dtb = PhysAddr;
 
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
 pub struct PageTableEntry(pub u64);
+
+impl VirtAddr {
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
 
 impl Add<u64> for VirtAddr {
     type Output = Self;
@@ -53,15 +57,15 @@ impl Shr<u64> for VirtAddr {
 }
 
 impl VirtAddr {
-    pub fn pdp_index(self) -> u64 {
+    pub fn pml4e_index(self) -> u64 {
         (self.0 >> 39) & 0x1ff
     }
 
-    pub fn pd_index(self) -> u64 {
+    pub fn pdpte_index(self) -> u64 {
         (self.0 >> 30) & 0x1ff
     }
 
-    pub fn pt_index(self) -> u64 {
+    pub fn pde_index(self) -> u64 {
         (self.0 >> 21) & 0x1ff
     }
 

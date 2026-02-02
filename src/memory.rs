@@ -1,7 +1,6 @@
 use crate::backend::MemoryOps;
+use crate::error::{Error, Result};
 use crate::types::*;
-
-const PAGE_OFFSET_SIZE: u32 = 12;
 
 // PageFrameNumber
 const PMASK: u64 = (!0xFu64 << 8) & 0xFFFFFFFFFu64;
@@ -11,6 +10,14 @@ const PMASK: u64 = (!0xFu64 << 8) & 0xFFFFFFFFFu64;
 pub struct AddressSpace<'a, B: MemoryOps<PhysAddr>> {
     backend: &'a B,
     dtb: Dtb,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PteLevel {
+    Pte = 1,
+    Pde,
+    Pdpte,
+    Pml4e,
 }
 
 pub const fn sign_extend_48bit(address: u64) -> u64 {
@@ -26,56 +33,52 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
         Self { backend, dtb }
     }
 
-    fn read_entry(&self, base: u64, index: u64) -> Result<PageTableEntry, String> {
-        self.backend.read(PhysAddr(8 * index + base))
+    fn read_entry(&self, table_base: PhysAddr, index: u64) -> Result<PageTableEntry> {
+        self.backend.read(table_base + 8 * index)
     }
 
     // TODO lots of bad casting here, needs to be rewritten
-    pub fn virt_to_phys(&self, vaddr: VirtAddr) -> Result<PhysAddr, String> {
-        let pdpe = self.read_entry(self.dtb.0.0, vaddr.pdp_index())?;
-        if !pdpe.is_present() {
-            return Err("bad pdpe".into());
+    pub fn virt_to_phys(&self, vaddr: VirtAddr) -> Result<PhysAddr> {
+        let pml4e = self.read_entry(self.dtb, vaddr.pml4e_index())?;
+        if !pml4e.is_present() {
+            return Err(Error::PTEntryNotPresent(PteLevel::Pml4e));
         }
 
-        let pde = self.read_entry(pdpe.0 & PMASK, vaddr.pd_index())?;
+        let pdpte = self.read_entry(pml4e.0 & PMASK, vaddr.pdpte_index())?;
+        if !pdpte.is_present() {
+            return Err(Error::PTEntryNotPresent(PteLevel::Pdpte));
+        }
+
+        if pdpte.is_large_page() {
+            return Ok((pdpte.0 & (!0u64 << 42 >> 12)) + (vaddr.0 & !(!0u64 << 30)));
+        }
+
+        let pde = self.read_entry(pdpte.0 & PMASK, vaddr.pde_index())?;
         if !pde.is_present() {
-            return Err("bad pde".into());
+            return Err(Error::PTEntryNotPresent(PteLevel::Pde));
         }
 
         if pde.is_large_page() {
-            return Ok(PhysAddr(
-                (pde.0 & (!0u64 << 42 >> 12)) + (vaddr.0 & !(!0u64 << 30)),
-            ));
+            return Ok((pde.0 & PMASK) + (vaddr.0 & !(!0u64 << 21)));
         }
 
-        let pte_address = self.read_entry(pde.0 & PMASK, vaddr.pt_index())?;
-        if !pte_address.is_present() {
-            return Err("bad pte address".into());
-        }
-
-        if pte_address.is_large_page() {
-            return Ok(PhysAddr(
-                (pte_address.0 & PMASK) + (vaddr.0 & !(!0u64 << 21)),
-            ));
-        }
-
-        let paddr = self.read_entry(pte_address.0 & PMASK, vaddr.pte_index())?;
-        let paddr = paddr.0 & PMASK;
+        let pte = self.read_entry(pde.0 & PMASK, vaddr.pte_index())?;
+        let paddr = pte.0 & PMASK;
         if paddr == 0 {
-            return Err("bad physical page".into());
+            return Err(Error::PTEntryNotPresent(PteLevel::Pte));
         }
 
-        Ok(PhysAddr(paddr + vaddr.page_offset()))
+        Ok(paddr + vaddr.page_offset())
     }
 }
 
 impl<'a, B: MemoryOps<PhysAddr>> MemoryOps<VirtAddr> for AddressSpace<'a, B> {
-    fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<usize, String> {
+    fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<usize> {
         let paddr = self.virt_to_phys(addr)?;
         self.backend.read_bytes(paddr, buf)
     }
 
-    fn write_bytes(&self, addr: VirtAddr, buf: &[u8]) -> Result<usize, String> {
+    fn write_bytes(&self, addr: VirtAddr, buf: &[u8]) -> Result<usize> {
         let paddr = self.virt_to_phys(addr)?;
         self.backend.write_bytes(paddr, buf)
     }

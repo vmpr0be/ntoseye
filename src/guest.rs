@@ -1,14 +1,13 @@
 use crate::{
     backend::MemoryOps,
+    error::{Error, Result},
     host::KvmHandle,
     memory::{self},
     symbols::{SymbolStore, TypeInfo},
     types::*,
 };
-use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use pelite::pe64::{Pe, PeView};
-use rayon::prelude::*;
 use zerocopy::{FromBytes, IntoBytes};
 
 /// used for enumeration without loading full WinObject
@@ -58,12 +57,12 @@ impl ModuleInfo {
 pub fn read_pe_image<'a, B: MemoryOps<PhysAddr>>(
     base_address: VirtAddr,
     memory: &memory::AddressSpace<'a, B>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>> {
     let mut header_buf = [0u8; 0x1000];
 
     memory.read_bytes(base_address, &mut header_buf)?;
 
-    let view = PeView::from_bytes(&header_buf).map_err(|e| format!("header parse error: {}", e))?;
+    let view = PeView::from_bytes(&header_buf)?;
     let optional_header = view.optional_header();
     let sections = view.section_headers();
 
@@ -100,7 +99,7 @@ impl SymbolRef<'_> {
         self.obj.address_of(self.rva)
     }
 
-    pub fn read<T>(&self, kvm: &KvmHandle) -> Result<T, String>
+    pub fn read<T>(&self, kvm: &KvmHandle) -> Result<T>
     where
         T: IntoBytes + zerocopy::FromBytes + std::marker::Copy,
     {
@@ -126,12 +125,8 @@ impl WinObject {
         }
     }
 
-    pub fn load_symbols(
-        mut self,
-        kvm: &KvmHandle,
-        symbols: &mut SymbolStore,
-    ) -> Result<Self, String> {
-        self.guid = Some(symbols.load_from_binary(kvm, &mut self)?);
+    pub fn load_symbols(mut self, kvm: &KvmHandle, symbols: &mut SymbolStore) -> Result<Self> {
+        self.guid = symbols.load_from_binary(kvm, &mut self)?;
         Ok(self)
     }
 
@@ -150,15 +145,16 @@ impl WinObject {
         memory::AddressSpace::new(backend, self.dtb)
     }
 
-    pub fn symbol<'a>(
-        &'a self,
-        symbols: &SymbolStore,
-        name: &str,
-    ) -> Result<SymbolRef<'a>, String> {
-        let guid = self.guid.ok_or("no guid found for binary")?;
+    pub fn symbol<'a, S>(&'a self, symbols: &SymbolStore, name: S) -> Result<SymbolRef<'a>>
+    where
+        S: Into<String>,
+    {
+        let name = name.into();
+
+        let guid = self.guid.ok_or(Error::ExpectedSymbols)?;
         let rva = symbols
-            .get_rva_of_symbol(guid, name)
-            .ok_or(format!("symbol `{}` not found", name))?;
+            .get_rva_of_symbol(guid, &name)
+            .ok_or(Error::SymbolNotFound(name))?;
         Ok(SymbolRef { obj: self, rva })
     }
 
@@ -166,11 +162,11 @@ impl WinObject {
         &self,
         symbols: &SymbolStore,
         address: VirtAddr,
-    ) -> Result<(String, u32), String> {
-        let guid = self.guid.ok_or("no guid found for binary")?;
+    ) -> Result<(String, u32)> {
+        let guid = self.guid.ok_or(Error::ExpectedSymbols)?;
         let result = symbols
             .get_address_of_closest_symbol(guid, self.base_address, address)
-            .ok_or(format!("no symbol found near address `{:#x}`", address))?;
+            .ok_or(Error::UnknownAddress(address))?;
         Ok(result)
     }
 
@@ -185,11 +181,14 @@ impl WinObject {
         PeView::from_bytes(&self.binary_snapshot).ok()
     }
 
-    pub fn class(&self, symbols: &SymbolStore, name: &str) -> Result<TypeInfo, String> {
-        let guid = self.guid.ok_or("no guid found for binary")?;
+    pub fn try_get_struct<S>(&self, symbols: &SymbolStore, name: S) -> Result<TypeInfo>
+    where
+        S: Into<String> + AsRef<str>,
+    {
+        let guid = self.guid.ok_or(Error::ExpectedSymbols)?;
         let type_info = symbols
-            .dump_struct_with_types(guid, name)
-            .ok_or("failed to find structure")?;
+            .dump_struct_with_types(guid, name.as_ref())
+            .ok_or(Error::StructNotFound(name.into()))?;
         Ok(type_info)
     }
 }
@@ -243,7 +242,7 @@ fn scan_large_pages(
         return false;
     }
 
-    let page: [u8; 0x1000] = match kvm.read(PhysAddr(pa_table)) {
+    let page: [u8; 0x1000] = match kvm.read(pa_table) {
         Ok(page) => page,
         Err(_) => return false,
     };
@@ -322,7 +321,7 @@ fn scan_small_pages(
         return;
     }
 
-    let page: [u8; 0x1000] = match kvm.read(PhysAddr(pa_table)) {
+    let page: [u8; 0x1000] = match kvm.read(pa_table) {
         Ok(page) => page,
         Err(_) => return,
     };
@@ -401,12 +400,12 @@ fn scan_small_pages(
     }
 }
 
-fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject, String> {
+fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject> {
     const KERNEL_VA_MIN: u64 = 0xfffff80000000000;
     const KERNEL_VA_MAX: u64 = 0xfffff807ffffffff;
 
     for pa_dtb in (0x1000u64..0x1000000).step_by(0x1000) {
-        let page: [u8; 0x1000] = match kvm.read(PhysAddr(pa_dtb)) {
+        let page: [u8; 0x1000] = match kvm.read(pa_dtb) {
             Ok(page) => page,
             Err(_) => continue,
         };
@@ -418,7 +417,7 @@ fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject, String> {
         let mut kernel_base = 0u64;
         let mut kernel_size = 0u64;
 
-        let kernel_space = memory::AddressSpace::new(kvm, Dtb(PhysAddr(pa_dtb)));
+        let kernel_space = memory::AddressSpace::new(kvm, pa_dtb);
 
         if scan_large_pages(
             &kvm,
@@ -447,10 +446,7 @@ fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject, String> {
                     for o in (0usize..0x1000).step_by(8) {
                         let poolcode = u64::read_from_bytes(&kernel[(p + o)..(p + o + 8)]).unwrap();
                         if poolcode == 0x45444F434C4F4F50u64 {
-                            return Ok(WinObject::new(
-                                Dtb(PhysAddr(pa_dtb)),
-                                VirtAddr(kernel_base + p as u64),
-                            ));
+                            return Ok(WinObject::new(pa_dtb, VirtAddr(kernel_base + p as u64)));
                         }
                     }
                 }
@@ -487,7 +483,7 @@ fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject, String> {
             for o in (0usize..0x1000).step_by(8) {
                 let poolcode = u64::read_from_bytes(&page_buf[o..o + 8]).unwrap();
                 if poolcode == 0x45444F434C4F4F50u64 {
-                    return Ok(WinObject::new(Dtb(PhysAddr(pa_dtb)), VirtAddr(va)));
+                    return Ok(WinObject::new(pa_dtb, VirtAddr(va)));
                 }
             }
         }
@@ -495,12 +491,12 @@ fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject, String> {
         break;
     }
 
-    Err("failed to find ntoskrnl base address".into())
+    Err(Error::NtoskrnlNotFound)
 }
 
 impl Guest {
     // TODO (everywhere) use MemoryOps, not KvmHandle...
-    pub fn new(kvm: &KvmHandle, symbols: &mut SymbolStore) -> Result<Self, String> {
+    pub fn new(kvm: &KvmHandle, symbols: &mut SymbolStore) -> Result<Self> {
         let ntoskrnl = get_ntoskrnl_winobj(kvm)?.load_symbols(kvm, symbols)?;
         Ok(Self { ntoskrnl })
     }
@@ -509,100 +505,33 @@ impl Guest {
         &self,
         kvm: &KvmHandle,
         symbols: &SymbolStore,
-    ) -> Result<Vec<ProcessInfo>, String> {
+    ) -> Result<Vec<ProcessInfo>> {
         let memory = self.ntoskrnl.memory(kvm);
 
-        let eprocess_info = self
-            .ntoskrnl
-            .class(symbols, "_EPROCESS")
-            .map_err(|_| "failed to get _EPROCESS type info")?;
+        let eprocess_info = self.ntoskrnl.try_get_struct(symbols, "_EPROCESS")?;
+        let active_process_links_offset =
+            eprocess_info.try_get_field_offset("ActiveProcessLinks")?;
+        let pcb_offset = eprocess_info.try_get_field_offset("Pcb")?;
 
-        let active_process_links_offset = eprocess_info
-            .fields
-            .get("ActiveProcessLinks")
-            .ok_or("ActiveProcessLinks field not found")?
-            .offset as u64;
+        let kprocess_info = self.ntoskrnl.try_get_struct(symbols, "_KPROCESS")?;
+        let dir_table_base_offset =
+            pcb_offset + kprocess_info.try_get_field_offset("DirectoryTableBase")?;
+        let unique_process_id_offset = eprocess_info.try_get_field_offset("UniqueProcessId")?;
+        let image_filename_offset = eprocess_info.try_get_field_offset("ImageFileName")?;
+        let peb_offset = eprocess_info.try_get_field_offset("Peb")?;
 
-        let pcb_offset = eprocess_info
-            .fields
-            .get("Pcb")
-            .ok_or("Pcb field not found")?
-            .offset as u64;
+        let peb_info = self.ntoskrnl.try_get_struct(symbols, "_PEB")?;
+        let ldr_offset = peb_info.try_get_field_offset("Ldr")?;
+        let image_base_address_offset = peb_info.try_get_field_offset("ImageBaseAddress")?;
 
-        let kprocess_info = self
-            .ntoskrnl
-            .class(symbols, "_KPROCESS")
-            .map_err(|_| "failed to get _KPROCESS type info")?;
-
-        let dir_table_base_offset = pcb_offset
-            + kprocess_info
-                .fields
-                .get("DirectoryTableBase")
-                .ok_or("DirectoryTableBase field not found in _KPROCESS")?
-                .offset as u64;
-
-        let unique_process_id_offset = eprocess_info
-            .fields
-            .get("UniqueProcessId")
-            .ok_or("UniqueProcessId field not found")?
-            .offset as u64;
-
-        let image_filename_offset = eprocess_info
-            .fields
-            .get("ImageFileName")
-            .ok_or("ImageFileName field not found")?
-            .offset as u64;
-
-        let peb_offset = eprocess_info
-            .fields
-            .get("Peb")
-            .ok_or("Peb field not found")?
-            .offset as u64;
-
-        let peb_info = self
-            .ntoskrnl
-            .class(symbols, "_PEB")
-            .map_err(|_| "failed to get _PEB type info")?;
-
-        let ldr_offset = peb_info
-            .fields
-            .get("Ldr")
-            .ok_or("Ldr field not found")?
-            .offset as u64;
-
-        let image_base_address_offset = peb_info
-            .fields
-            .get("ImageBaseAddress")
-            .ok_or("ImageBaseAddress field not found")?
-            .offset as u64;
-
-        let ldr_info = self
-            .ntoskrnl
-            .class(symbols, "_PEB_LDR_DATA")
-            .map_err(|_| "failed to get _PEB_LDR_DATA type info")?;
-
-        let in_load_order_offset = ldr_info
-            .fields
-            .get("InLoadOrderModuleList")
-            .ok_or("InLoadOrderModuleList field not found")?
-            .offset as u64;
+        let ldr_info = self.ntoskrnl.try_get_struct(symbols, "_PEB_LDR_DATA")?;
+        let in_load_order_offset = ldr_info.try_get_field_offset("InLoadOrderModuleList")?;
 
         let ldr_entry_info = self
             .ntoskrnl
-            .class(symbols, "_LDR_DATA_TABLE_ENTRY")
-            .map_err(|_| "failed to get _LDR_DATA_TABLE_ENTRY type info")?;
-
-        let dll_base_offset = ldr_entry_info
-            .fields
-            .get("DllBase")
-            .ok_or("DllBase field not found")?
-            .offset as u64;
-
-        let base_dll_name_offset = ldr_entry_info
-            .fields
-            .get("BaseDllName")
-            .ok_or("BaseDllName field not found")?
-            .offset as u64;
+            .try_get_struct(symbols, "_LDR_DATA_TABLE_ENTRY")?;
+        let dll_base_offset = ldr_entry_info.try_get_field_offset("DllBase")?;
+        let base_dll_name_offset = ldr_entry_info.try_get_field_offset("BaseDllName")?;
 
         let ps_initial_system_process: VirtAddr = self
             .ntoskrnl
@@ -626,8 +555,6 @@ impl Guest {
             if dtb == 0 {
                 break;
             }
-
-            let dtb = Dtb(PhysAddr(dtb));
 
             let name = self
                 .get_full_process_name(
@@ -689,23 +616,23 @@ impl Guest {
         in_load_order_offset: u64,
         dll_base_offset: u64,
         base_dll_name_offset: u64,
-    ) -> Result<String, String> {
+    ) -> Result<String> {
         let kernel_memory = self.ntoskrnl.memory(kvm);
         let process_memory = memory::AddressSpace::new(kvm, dtb);
 
         let peb_addr: VirtAddr = kernel_memory.read(eprocess_va + peb_offset)?;
-        if peb_addr.0 == 0 {
-            return Err("no PEB".into());
+        if peb_addr.is_zero() {
+            return Err(Error::MissingPEB);
         }
 
         let image_base: VirtAddr = process_memory.read(peb_addr + image_base_address_offset)?;
-        if image_base.0 == 0 {
-            return Err("no ImageBaseAddress".into());
+        if image_base.is_zero() {
+            return Err(Error::MissingImageBase);
         }
 
         let ldr_addr: VirtAddr = process_memory.read(peb_addr + ldr_offset)?;
-        if ldr_addr.0 == 0 {
-            return Err("no Ldr".into());
+        if ldr_addr.is_zero() {
+            return Err(Error::MissingLDR);
         }
 
         let list_head: VirtAddr = process_memory.read(ldr_addr + in_load_order_offset)?;
@@ -747,7 +674,7 @@ impl Guest {
             current = next;
         }
 
-        Err("main module not found in LDR list".into())
+        Err(Error::MissingImage)
     }
 
     pub fn winobj_from_process_info(
@@ -755,19 +682,11 @@ impl Guest {
         kvm: &KvmHandle,
         symbols: &SymbolStore,
         info: &ProcessInfo,
-    ) -> Result<WinObject, String> {
+    ) -> Result<WinObject> {
         let memory = memory::AddressSpace::new(kvm, info.dtb);
 
-        let eprocess_info = self
-            .ntoskrnl
-            .class(symbols, "_EPROCESS")
-            .map_err(|_| "failed to get _EPROCESS type info")?;
-
-        let peb_offset = eprocess_info
-            .fields
-            .get("Peb")
-            .ok_or("Peb field not found")?
-            .offset as u64;
+        let eprocess_info = self.ntoskrnl.try_get_struct(symbols, "_EPROCESS")?;
+        let peb_offset = eprocess_info.try_get_field_offset("Peb")?;
 
         let peb_addr: VirtAddr = self
             .ntoskrnl
@@ -775,19 +694,11 @@ impl Guest {
             .read(info.eprocess_va + peb_offset)?;
 
         if peb_addr.0 == 0 {
-            return Err("process has no PEB (kernel process?)".into());
+            return Err(Error::MissingPEB);
         }
 
-        let peb_info = self
-            .ntoskrnl
-            .class(symbols, "_PEB")
-            .map_err(|_| "failed to get _PEB type info")?;
-
-        let image_base_offset = peb_info
-            .fields
-            .get("ImageBaseAddress")
-            .ok_or("ImageBaseAddress field not found")?
-            .offset as u64;
+        let peb_info = self.ntoskrnl.try_get_struct(symbols, "_PEB")?;
+        let image_base_offset = peb_info.try_get_field_offset("ImageBaseAddress")?;
 
         let base_address: VirtAddr = memory.read(peb_addr + image_base_offset)?;
 
@@ -799,77 +710,37 @@ impl Guest {
         kvm: &KvmHandle,
         symbols: &SymbolStore,
         info: &ProcessInfo,
-    ) -> Result<Vec<ModuleInfo>, String> {
+    ) -> Result<Vec<ModuleInfo>> {
         let kernel_memory = self.ntoskrnl.memory(kvm);
         let process_memory = memory::AddressSpace::new(kvm, info.dtb);
 
         // Get PEB offset from _EPROCESS
-        let eprocess_info = self
-            .ntoskrnl
-            .class(symbols, "_EPROCESS")
-            .map_err(|_| "failed to get _EPROCESS type info")?;
-
-        let peb_offset = eprocess_info
-            .fields
-            .get("Peb")
-            .ok_or("Peb field not found")?
-            .offset as u64;
+        let eprocess_info = self.ntoskrnl.try_get_struct(symbols, "_EPROCESS")?;
+        let peb_offset = eprocess_info.try_get_field_offset("Peb")?;
 
         let peb_addr: VirtAddr = kernel_memory.read(info.eprocess_va + peb_offset)?;
-        if peb_addr.0 == 0 {
-            return Err("process has no PEB (kernel process?)".into());
+        if peb_addr.is_zero() {
+            return Err(Error::MissingPEB);
         }
 
-        let peb_info = self
-            .ntoskrnl
-            .class(symbols, "_PEB")
-            .map_err(|_| "failed to get _PEB type info")?;
-
-        let ldr_offset = peb_info
-            .fields
-            .get("Ldr")
-            .ok_or("Ldr field not found")?
-            .offset as u64;
+        let peb_info = self.ntoskrnl.try_get_struct(symbols, "_PEB")?;
+        let ldr_offset = peb_info.try_get_field_offset("Ldr")?;
 
         let ldr_addr: VirtAddr = process_memory.read(peb_addr + ldr_offset)?;
 
-        if ldr_addr.0 == 0 {
+        if ldr_addr.is_zero() {
             return Ok(Vec::new());
         }
 
-        let ldr_info = self
-            .ntoskrnl
-            .class(symbols, "_PEB_LDR_DATA")
-            .map_err(|_| "failed to get _PEB_LDR_DATA type info")?;
-
-        let in_load_order_offset = ldr_info
-            .fields
-            .get("InLoadOrderModuleList")
-            .ok_or("InLoadOrderModuleList field not found")?
-            .offset as u64;
+        let ldr_info = self.ntoskrnl.try_get_struct(symbols, "_PEB_LDR_DATA")?;
+        let in_load_order_offset = ldr_info.try_get_field_offset("InLoadOrderModuleList")?;
 
         let ldr_entry_info = self
             .ntoskrnl
-            .class(symbols, "_LDR_DATA_TABLE_ENTRY")
-            .map_err(|_| "failed to get _LDR_DATA_TABLE_ENTRY type info")?;
-
-        let dll_base_offset = ldr_entry_info
-            .fields
-            .get("DllBase")
-            .ok_or("DllBase field not found")?
-            .offset as u64;
-
-        let size_of_image_offset = ldr_entry_info
-            .fields
-            .get("SizeOfImage")
-            .ok_or("SizeOfImage field not found")?
-            .offset as u64;
-
-        let base_dll_name_offset = ldr_entry_info
-            .fields
-            .get("BaseDllName")
-            .ok_or("BaseDllName field not found")?
-            .offset as u64;
+            .try_get_struct(symbols, "_LDR_DATA_TABLE_ENTRY")?;
+        let dll_base_offset = ldr_entry_info.try_get_field_offset("DllBase")?;
+        let size_of_image_offset = ldr_entry_info.try_get_field_offset("SizeOfImage")?;
+        let base_dll_name_offset = ldr_entry_info.try_get_field_offset("BaseDllName")?;
 
         let list_head: VirtAddr = process_memory.read(ldr_addr + in_load_order_offset)?;
         let list_end = ldr_addr + in_load_order_offset;
@@ -930,7 +801,7 @@ impl Guest {
         &self,
         kvm: &KvmHandle,
         symbols: &SymbolStore,
-    ) -> Result<Vec<ModuleInfo>, String> {
+    ) -> Result<Vec<ModuleInfo>> {
         let memory = self.ntoskrnl.memory(kvm);
 
         let ps_loaded_module_list = self
@@ -942,27 +813,14 @@ impl Guest {
         // Fall back to _LDR_DATA_TABLE_ENTRY if KLDR not found
         let ldr_entry_info = self
             .ntoskrnl
-            .class(symbols, "_KLDR_DATA_TABLE_ENTRY")
-            .or_else(|_| self.ntoskrnl.class(symbols, "_LDR_DATA_TABLE_ENTRY"))
-            .map_err(|_| "failed to get LDR entry type info")?;
-
-        let dll_base_offset = ldr_entry_info
-            .fields
-            .get("DllBase")
-            .ok_or("DllBase field not found")?
-            .offset as u64;
-
-        let size_of_image_offset = ldr_entry_info
-            .fields
-            .get("SizeOfImage")
-            .ok_or("SizeOfImage field not found")?
-            .offset as u64;
-
-        let base_dll_name_offset = ldr_entry_info
-            .fields
-            .get("BaseDllName")
-            .ok_or("BaseDllName field not found")?
-            .offset as u64;
+            .try_get_struct(symbols, "_KLDR_DATA_TABLE_ENTRY")
+            .or_else(|_| {
+                self.ntoskrnl
+                    .try_get_struct(symbols, "_LDR_DATA_TABLE_ENTRY")
+            })?;
+        let dll_base_offset = ldr_entry_info.try_get_field_offset("DllBase")?;
+        let size_of_image_offset = ldr_entry_info.try_get_field_offset("SizeOfImage")?;
+        let base_dll_name_offset = ldr_entry_info.try_get_field_offset("BaseDllName")?;
 
         let list_head: VirtAddr = memory.read(ps_loaded_module_list)?;
         let list_end = ps_loaded_module_list;
@@ -1022,7 +880,7 @@ impl Guest {
         &self,
         kvm: &KvmHandle,
         symbols: &mut SymbolStore,
-    ) -> Result<usize, String> {
+    ) -> Result<usize> {
         use crate::symbols::{DownloadJob, SymbolStore, download_pdbs_parallel};
 
         let modules = self.get_kernel_modules(kvm, symbols)?;
@@ -1037,8 +895,8 @@ impl Guest {
                 continue;
             }
 
-            if let Ok((job, guid)) =
-                SymbolStore::extract_download_job(kvm, dtb, module.base_address, &module.name)
+            if let Ok(Some((job, guid))) =
+                SymbolStore::extract_download_job(kvm, dtb, module.base_address)
             {
                 if symbols.has_guid(guid) {
                     already_loaded.push((job, guid, module.clone()));
@@ -1060,7 +918,8 @@ impl Guest {
                     .progress_chars("#-"),
             );
 
-            for (job, guid, module) in already_loaded.into_iter().chain(jobs_with_info.into_iter()) {
+            for (job, guid, module) in already_loaded.into_iter().chain(jobs_with_info.into_iter())
+            {
                 if symbols
                     .load_downloaded_pdb(
                         &job,
@@ -1088,7 +947,7 @@ impl Guest {
         kvm: &KvmHandle,
         symbols: &mut SymbolStore,
         info: &ProcessInfo,
-    ) -> Result<usize, String> {
+    ) -> Result<usize> {
         use crate::symbols::{DownloadJob, SymbolStore, download_pdbs_parallel};
 
         let modules = self.get_process_modules(kvm, symbols, info)?;
@@ -1099,8 +958,8 @@ impl Guest {
         let mut loaded = 0;
 
         for module in &modules {
-            if let Ok((job, guid)) =
-                SymbolStore::extract_download_job(kvm, dtb, module.base_address, &module.name)
+            if let Ok(Some((job, guid))) =
+                SymbolStore::extract_download_job(kvm, dtb, module.base_address)
             {
                 if symbols.has_guid(guid) {
                     already_loaded.push((job, guid, module.clone()));

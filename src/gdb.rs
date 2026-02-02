@@ -3,20 +3,15 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use crate::error::{Error, Result};
 use crate::types::VirtAddr;
-
-#[derive(Debug)]
-pub enum GdbError {
-    Io(io::Error),
-    Protocol(String),
-    NotSupported,
-}
 
 #[derive(Debug, Clone)]
 pub struct RegisterInfo {
     pub name: String,
     pub offset: usize,
     pub size: usize,
+    #[allow(dead_code)]
     pub regnum: usize,
 }
 
@@ -54,13 +49,11 @@ impl BreakpointManager {
         address: VirtAddr,
         target_cr3: Option<u64>,
         symbol: Option<String>,
-    ) -> Result<u32, String> {
+    ) -> Result<u32> {
         let id = self.next_id;
         self.next_id += 1;
 
-        client
-            .set_breakpoint(address.0, 1)
-            .map_err(|e| format!("failed to set breakpoint: {:?}", e))?;
+        client.set_breakpoint(address.0, 1)?;
 
         let bp = Breakpoint {
             id,
@@ -74,52 +67,37 @@ impl BreakpointManager {
         Ok(id)
     }
 
-    pub fn remove(&mut self, client: &mut GdbClient, id: u32) -> Result<(), String> {
-        let bp = self
-            .breakpoints
-            .remove(&id)
-            .ok_or_else(|| format!("breakpoint {} not found", id))?;
+    pub fn remove(&mut self, client: &mut GdbClient, id: u32) -> Result<()> {
+        let bp = self.breakpoints.remove(&id).ok_or(Error::BPNotFound(id))?;
 
         if bp.enabled {
-            client
-                .remove_breakpoint(bp.address.0, 1)
-                .map_err(|e| format!("failed to remove breakpoint: {:?}", e))?;
+            client.remove_breakpoint(bp.address.0, 1)?;
         }
 
         Ok(())
     }
 
-    pub fn enable(&mut self, client: &mut GdbClient, id: u32) -> Result<(), String> {
-        let bp = self
-            .breakpoints
-            .get_mut(&id)
-            .ok_or_else(|| format!("breakpoint {} not found", id))?;
+    pub fn enable(&mut self, client: &mut GdbClient, id: u32) -> Result<()> {
+        let bp = self.breakpoints.get_mut(&id).ok_or(Error::BPNotFound(id))?;
 
         if bp.enabled {
             return Ok(());
         }
 
-        client
-            .set_breakpoint(bp.address.0, 1)
-            .map_err(|e| format!("failed to enable breakpoint: {:?}", e))?;
+        client.set_breakpoint(bp.address.0, 1)?;
 
         bp.enabled = true;
         Ok(())
     }
 
-    pub fn disable(&mut self, client: &mut GdbClient, id: u32) -> Result<(), String> {
-        let bp = self
-            .breakpoints
-            .get_mut(&id)
-            .ok_or_else(|| format!("breakpoint {} not found", id))?;
+    pub fn disable(&mut self, client: &mut GdbClient, id: u32) -> Result<()> {
+        let bp = self.breakpoints.get_mut(&id).ok_or(Error::BPNotFound(id))?;
 
         if !bp.enabled {
             return Ok(());
         }
 
-        client
-            .remove_breakpoint(bp.address.0, 1)
-            .map_err(|e| format!("failed to disable breakpoint: {:?}", e))?;
+        client.remove_breakpoint(bp.address.0, 1)?;
 
         bp.enabled = false;
         Ok(())
@@ -177,17 +155,23 @@ impl RegisterMap {
     //     self.by_name.get(name).map(|r| r.offset..r.offset + r.size)
     // }
 
-    pub fn read_u64(&self, name: &str, data: &[u8]) -> Option<u64> {
-        let info = self.by_name.get(name)?;
+    pub fn read_u64<S>(&self, name: S, data: &[u8]) -> Result<u64>
+    where
+        S: Into<String> + AsRef<str>,
+    {
+        let info = self
+            .by_name
+            .get(name.as_ref())
+            .ok_or(Error::RegisterNotFound(name.into()))?;
         if info.offset + info.size > data.len() {
-            return None;
+            return Err(Error::BufferNotEnough);
         }
         let slice = &data[info.offset..info.offset + info.size];
 
         let mut buf = [0u8; 8];
         let copy_len = slice.len().min(8);
         buf[..copy_len].copy_from_slice(&slice[..copy_len]);
-        Some(u64::from_le_bytes(buf))
+        Ok(u64::from_le_bytes(buf))
     }
 
     // pub fn iter(&self) -> impl Iterator<Item = &RegisterInfo> {
@@ -268,12 +252,6 @@ impl RegisterMap {
     }
 }
 
-impl From<io::Error> for GdbError {
-    fn from(err: io::Error) -> Self {
-        GdbError::Io(err)
-    }
-}
-
 pub struct GdbClient {
     stream: TcpStream,
     no_ack_mode: bool,
@@ -281,7 +259,7 @@ pub struct GdbClient {
 }
 
 impl GdbClient {
-    pub fn connect(addr: &str) -> Result<Self, GdbError> {
+    pub fn connect(addr: &str) -> Result<Self> {
         let stream = TcpStream::connect(addr)?;
 
         let mut client = GdbClient {
@@ -303,7 +281,7 @@ impl GdbClient {
         Ok(client)
     }
 
-    fn force_stop_and_resync(&mut self) -> Result<(), GdbError> {
+    fn force_stop_and_resync(&mut self) -> Result<()> {
         self.stream
             .set_read_timeout(Some(Duration::from_millis(100)))?;
 
@@ -326,7 +304,7 @@ impl GdbClient {
         Ok(())
     }
 
-    pub fn send_packet(&mut self, data: &str) -> Result<String, GdbError> {
+    pub fn send_packet(&mut self, data: &str) -> Result<String> {
         let checksum: u8 = data.bytes().fold(0u8, |acc, b| acc.wrapping_add(b));
 
         let packet = format!("${}#{:02x}", data, checksum);
@@ -337,7 +315,7 @@ impl GdbClient {
         self.read_packet()
     }
 
-    fn read_packet(&mut self) -> Result<String, GdbError> {
+    fn read_packet(&mut self) -> Result<String> {
         let mut buf = [0u8; 1];
         let mut response = String::new();
 
@@ -370,67 +348,64 @@ impl GdbClient {
         Ok(response)
     }
 
-    fn enable_no_ack_mode(&mut self) -> Result<(), GdbError> {
+    fn enable_no_ack_mode(&mut self) -> Result<()> {
         let response = self.send_packet("QStartNoAckMode")?;
         if response == "OK" {
             self.no_ack_mode = true;
             Ok(())
         } else {
-            Err(GdbError::NotSupported)
+            Err(Error::NotSupported)
         }
     }
 
-    pub fn query_halt_reason(&mut self) -> Result<String, GdbError> {
+    pub fn query_halt_reason(&mut self) -> Result<String> {
         self.send_packet("?")
     }
 
-    pub fn set_breakpoint(&mut self, addr: u64, kind: u32) -> Result<(), GdbError> {
+    pub fn set_breakpoint(&mut self, addr: u64, kind: u32) -> Result<()> {
         let response = self.send_packet(&format!("Z0,{:x},{:x}", addr, kind))?;
         if response == "OK" || response.is_empty() {
             Ok(())
         } else if response.starts_with('E') {
-            Err(GdbError::Protocol(format!(
+            Err(Error::RSP(format!(
                 "failed to set breakpoint: {}",
                 response
             )))
         } else {
-            Err(GdbError::NotSupported)
+            Err(Error::NotSupported)
         }
     }
 
-    pub fn remove_breakpoint(&mut self, addr: u64, kind: u32) -> Result<(), GdbError> {
+    pub fn remove_breakpoint(&mut self, addr: u64, kind: u32) -> Result<()> {
         let response = self.send_packet(&format!("z0,{:x},{:x}", addr, kind))?;
         if response == "OK" || response.is_empty() {
             Ok(())
         } else if response.starts_with('E') {
-            Err(GdbError::Protocol(format!(
+            Err(Error::RSP(format!(
                 "failed to remove breakpoint: {}",
                 response
             )))
         } else {
-            Err(GdbError::NotSupported)
+            Err(Error::NotSupported)
         }
     }
 
-    pub fn read_registers(&mut self) -> Result<Vec<u8>, GdbError> {
+    pub fn read_registers(&mut self) -> Result<Vec<u8>> {
         let response = self.send_packet("g")?;
 
         if response.starts_with('E') {
-            return Err(GdbError::Protocol(format!(
+            return Err(Error::RSP(format!(
                 "failed to read registers: {}",
                 response
             )));
         }
 
-        let bytes: Result<Vec<u8>, _> = (0..response.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&response[i..i + 2], 16))
-            .collect();
-
-        bytes.map_err(|_| GdbError::Protocol("invalid hex in register data".to_string()))
+        let bytes = hex::decode(&response)?;
+        Ok(bytes)
     }
 
-    pub fn write_registers(&mut self, data: &[u8]) -> Result<(), GdbError> {
+    #[allow(dead_code)]
+    pub fn write_registers(&mut self, data: &[u8]) -> Result<()> {
         let hex_data: String = data.iter().map(|b| format!("{:02x}", b)).collect();
 
         let response = self.send_packet(&format!("G{}", hex_data))?;
@@ -438,14 +413,14 @@ impl GdbClient {
         if response == "OK" {
             Ok(())
         } else {
-            Err(GdbError::Protocol(format!(
+            Err(Error::RSP(format!(
                 "failed to write registers: {}",
                 response
             )))
         }
     }
 
-    fn send_command_no_reply(&mut self, data: &str) -> Result<(), GdbError> {
+    fn send_command_no_reply(&mut self, data: &str) -> Result<()> {
         let checksum: u8 = data.bytes().fold(0u8, |acc, b| acc.wrapping_add(b));
         let packet = format!("${}#{:02x}", data, checksum);
 
@@ -458,17 +433,14 @@ impl GdbClient {
             let mut buf = [0u8; 1];
             self.stream.read_exact(&mut buf)?;
             if buf[0] != b'+' {
-                return Err(GdbError::Protocol(format!(
-                    "expected ACK, got 0x{:02x}",
-                    buf[0]
-                )));
+                return Err(Error::RSP(format!("expected ACK, got 0x{:02x}", buf[0])));
             }
         }
 
         Ok(())
     }
 
-    pub fn continue_execution(&mut self) -> Result<(), GdbError> {
+    pub fn continue_execution(&mut self) -> Result<()> {
         // set continue thread to -1 (all threads)
         let _ = self.send_packet("Hc-1")?;
         self.send_command_no_reply("c")?;
@@ -476,28 +448,31 @@ impl GdbClient {
         Ok(())
     }
 
-    pub fn continue_at(&mut self, addr: u64) -> Result<(), GdbError> {
+    #[allow(dead_code)]
+    pub fn continue_at(&mut self, addr: u64) -> Result<()> {
         self.send_command_no_reply(&format!("c{:x}", addr))
     }
 
-    pub fn step(&mut self) -> Result<(), GdbError> {
+    pub fn step(&mut self) -> Result<()> {
         self.send_command_no_reply("s")?;
         self.is_running = true;
         Ok(())
     }
 
-    pub fn step_at(&mut self, addr: u64) -> Result<(), GdbError> {
+    #[allow(dead_code)]
+    pub fn step_at(&mut self, addr: u64) -> Result<()> {
         self.send_command_no_reply(&format!("s{:x}", addr))?;
         self.is_running = true;
         Ok(())
     }
 
-    pub fn step_and_wait(&mut self) -> Result<String, GdbError> {
+    #[allow(dead_code)]
+    pub fn step_and_wait(&mut self) -> Result<String> {
         self.step()?;
         self.wait_for_stop()
     }
 
-    pub fn wait_for_stop(&mut self) -> Result<String, GdbError> {
+    pub fn wait_for_stop(&mut self) -> Result<String> {
         if !self.is_running {
             return self.query_halt_reason();
         }
@@ -507,12 +482,12 @@ impl GdbClient {
         Ok(response)
     }
 
-    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), GdbError> {
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
         self.stream.set_read_timeout(timeout)?;
         Ok(())
     }
 
-    pub fn try_wait_for_stop(&mut self) -> Result<Option<String>, GdbError> {
+    pub fn try_wait_for_stop(&mut self) -> Result<Option<String>> {
         if !self.is_running {
             return Ok(Some(self.query_halt_reason()?));
         }
@@ -522,7 +497,7 @@ impl GdbClient {
                 self.is_running = false;
                 Ok(Some(response))
             }
-            Err(GdbError::Io(ref e))
+            Err(Error::Io(ref e))
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
                 Ok(None)
@@ -531,7 +506,7 @@ impl GdbClient {
         }
     }
 
-    pub fn interrupt(&mut self) -> Result<(), GdbError> {
+    pub fn interrupt(&mut self) -> Result<()> {
         if !self.is_running {
             return Ok(());
         }
@@ -546,7 +521,7 @@ impl GdbClient {
         Ok(())
     }
 
-    pub fn get_thread_list(&mut self) -> Result<Vec<String>, GdbError> {
+    pub fn get_thread_list(&mut self) -> Result<Vec<String>> {
         let mut threads = Vec::new();
         let mut response = self.send_packet("qfThreadInfo")?;
 
@@ -570,10 +545,10 @@ impl GdbClient {
         Ok(threads)
     }
 
-    pub fn set_current_thread(&mut self, thread_id: &str) -> Result<(), GdbError> {
+    pub fn set_current_thread(&mut self, thread_id: &str) -> Result<()> {
         let resp_g = self.send_packet(&format!("Hg{}", thread_id))?;
         if resp_g != "OK" {
-            return Err(GdbError::Protocol(format!(
+            return Err(Error::RSP(format!(
                 "failed to set general thread: {}",
                 resp_g
             )));
@@ -581,7 +556,7 @@ impl GdbClient {
 
         let resp_c = self.send_packet(&format!("Hc{}", thread_id))?;
         if resp_c != "OK" {
-            return Err(GdbError::Protocol(format!(
+            return Err(Error::RSP(format!(
                 "failed to set control thread: {}",
                 resp_c
             )));
@@ -590,7 +565,7 @@ impl GdbClient {
         Ok(())
     }
 
-    pub fn get_stopped_thread_id(&mut self) -> Result<String, GdbError> {
+    pub fn get_stopped_thread_id(&mut self) -> Result<String> {
         let response = self.send_packet("?")?;
 
         if response.starts_with('T') {
@@ -602,12 +577,12 @@ impl GdbClient {
             }
         }
 
-        Err(GdbError::Protocol(
+        Err(Error::RSP(
             "could not determine thread from stop reply".into(),
         ))
     }
 
-    pub fn get_register_map(&mut self) -> Result<RegisterMap, GdbError> {
+    pub fn get_register_map(&mut self) -> Result<RegisterMap> {
         let mut xml = String::new();
         let mut offset = 0;
 
@@ -616,7 +591,7 @@ impl GdbClient {
             let response = self.send_packet(&query)?;
 
             if response.is_empty() {
-                return Err(GdbError::NotSupported);
+                return Err(Error::NotSupported);
             }
 
             let (marker, data) = response.split_at(1);
@@ -627,7 +602,7 @@ impl GdbClient {
                 "l" => break,    // last chunk
                 "m" => continue, // more data
                 _ => {
-                    return Err(GdbError::Protocol(format!(
+                    return Err(Error::RSP(format!(
                         "unexpected qXfer response: {}",
                         response
                     )));
@@ -640,7 +615,7 @@ impl GdbClient {
         Ok(RegisterMap::parse_target_xml(&full_xml))
     }
 
-    fn resolve_xml_includes(&mut self, xml: &str) -> Result<String, GdbError> {
+    fn resolve_xml_includes(&mut self, xml: &str) -> Result<String> {
         let mut result = xml.to_string();
 
         while let Some(start) = result.find("<xi:include") {
@@ -665,7 +640,7 @@ impl GdbClient {
         Ok(result)
     }
 
-    fn fetch_feature_file(&mut self, filename: &str) -> Result<String, GdbError> {
+    fn fetch_feature_file(&mut self, filename: &str) -> Result<String> {
         let mut xml = String::new();
         let mut offset = 0;
 
@@ -674,7 +649,7 @@ impl GdbClient {
             let response = self.send_packet(&query)?;
 
             if response.is_empty() {
-                return Err(GdbError::NotSupported);
+                return Err(Error::NotSupported);
             }
 
             let (marker, data) = response.split_at(1);
@@ -685,7 +660,7 @@ impl GdbClient {
                 "l" => break,
                 "m" => continue,
                 _ => {
-                    return Err(GdbError::Protocol(format!(
+                    return Err(Error::RSP(format!(
                         "unexpected qXfer response for {}: {}",
                         filename, response
                     )));
