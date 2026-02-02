@@ -8,6 +8,7 @@ use crate::{
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use pelite::pe64::{Pe, PeView};
+use rayon::prelude::*;
 use zerocopy::{FromBytes, IntoBytes};
 
 /// used for enumeration without loading full WinObject
