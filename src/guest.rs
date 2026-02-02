@@ -476,7 +476,8 @@ impl Guest {
             visited.insert(current_eprocess.0);
 
             let pid: u64 = memory.read(current_eprocess + unique_process_id_offset)?;
-            let dtb: u64 = memory.read(current_eprocess + dir_table_base_offset)?;
+            let mut dtb: Dtb = memory.read(current_eprocess + dir_table_base_offset)?;
+            dtb &= !0xfff;
 
             if dtb == 0 {
                 break;
