@@ -1,10 +1,14 @@
 use argh::FromArgs;
 use single_instance::SingleInstance;
 
-use crate::repl::start_repl;
+use crate::{
+    error::{Error, Result},
+    repl::start_repl,
+};
 
 mod backend;
 mod debugger;
+mod error;
 mod gdb;
 mod guest;
 mod host;
@@ -54,7 +58,7 @@ there, you must edit & add the following:
   </qemu:commandline>
 </domain>";
 
-fn main() -> Result<(), String> {
+fn main() -> Result<()> {
     let args: Args = argh::from_env();
     if args.version {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -68,7 +72,7 @@ fn main() -> Result<(), String> {
 
     let instance = SingleInstance::new("ntoseye").unwrap();
     if !instance.is_single() {
-        return Err("another instance of ntoseye is already running".into());
+        return Err(Error::AlreadyRunning);
     }
 
     symbols::FORCE_DOWNLOADS
@@ -85,7 +89,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_startup() -> Result<(), String> {
+    fn test_startup() -> Result<()> {
         let mut debugger = debugger::DebuggerContext::new()?;
         let _ = debugger.get_startup_message_data()?;
 

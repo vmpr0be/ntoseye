@@ -1,5 +1,6 @@
 use crate::{
     backend::MemoryOps,
+    error::{Error, Result},
     guest::WinObject,
     host::KvmHandle,
     memory,
@@ -21,7 +22,6 @@ use std::{
     fs::File,
     path::PathBuf,
     sync::{Arc, OnceLock},
-    thread,
 };
 use std::{fmt, io::Cursor};
 
@@ -92,10 +92,7 @@ impl DownloadJob {
     }
 }
 
-fn download_pdb_with_progress(
-    job: &DownloadJob,
-    mp: &MultiProgress,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn download_pdb_with_progress(job: &DownloadJob, mp: &MultiProgress) -> Result<()> {
     if !job.needs_download() {
         return Ok(());
     }
@@ -120,7 +117,7 @@ fn download_pdb_with_progress(
     Ok(())
 }
 
-pub fn download_pdbs_parallel(jobs: Vec<DownloadJob>) -> Vec<Result<PathBuf, String>> {
+pub fn download_pdbs_parallel(jobs: Vec<DownloadJob>) -> Vec<Result<PathBuf>> {
     let mp = Arc::new(MultiProgress::new());
 
     jobs.into_par_iter()
@@ -130,19 +127,17 @@ pub fn download_pdbs_parallel(jobs: Vec<DownloadJob>) -> Vec<Result<PathBuf, Str
             }
 
             let mp = Arc::clone(&mp);
-            download_pdb_with_progress(&job, &mp)
-                .map(|_| job.path)
-                .map_err(|e| e.to_string())
+            download_pdb_with_progress(&job, &mp).map(|_| job.path)
         })
         .collect::<Vec<_>>()
 }
 
-fn download_pdb_single(job: &DownloadJob) -> Result<(), String> {
+fn download_pdb_single(job: &DownloadJob) -> Result<()> {
     if !job.needs_download() {
         return Ok(());
     }
 
-    let response = reqwest::blocking::get(&job.url).map_err(|e| e.to_string())?;
+    let response = reqwest::blocking::get(&job.url)?;
     let total_size = response.content_length().unwrap_or(0);
 
     let pb = ProgressBar::new(total_size);
@@ -154,10 +149,10 @@ fn download_pdb_single(job: &DownloadJob) -> Result<(), String> {
 
     pb.set_message(job.filename.clone());
 
-    let mut file = File::create(&job.path).map_err(|e| e.to_string())?;
+    let mut file = File::create(&job.path)?;
     let mut downloaded = pb.wrap_read(response);
 
-    std::io::copy(&mut downloaded, &mut file).map_err(|e| e.to_string())?;
+    std::io::copy(&mut downloaded, &mut file)?;
     pb.finish_and_clear();
 
     Ok(())
@@ -226,6 +221,7 @@ impl fmt::Display for ParsedType {
 #[derive(Debug, Clone)]
 pub struct FieldInfo {
     pub offset: u32,
+    #[allow(dead_code)]
     pub size: u64,
     pub type_data: ParsedType,
 }
@@ -235,6 +231,18 @@ pub struct TypeInfo {
     pub name: String,
     pub size: usize,
     pub fields: HashMap<String, FieldInfo>,
+}
+
+impl TypeInfo {
+    pub fn try_get_field_offset<S>(&self, field_name: S) -> Result<u64>
+    where
+        S: Into<String> + AsRef<str>,
+    {
+        self.fields
+            .get(field_name.as_ref())
+            .ok_or(Error::FieldNotFound(field_name.into()))
+            .map(|f| f.offset as u64)
+    }
 }
 
 /// A loaded module with its symbols and address range.
@@ -266,14 +274,9 @@ impl SymbolStore {
         &mut self,
         kvm: &KvmHandle,
         object: &mut WinObject,
-    ) -> Result<u128, String> {
-        let view = object
-            .view(kvm)
-            .ok_or("failed to view object".to_string())?;
-        let debug = view
-            .debug()
-            .ok()
-            .ok_or("failed to get object debug section".to_string())?;
+    ) -> Result<Option<u128>> {
+        let view = object.view(kvm).ok_or(Error::ViewFailed)?;
+        let debug = view.debug()?;
 
         for entry in debug.iter().filter_map(|e| e.entry().ok()) {
             if let Some(cv) = entry.as_code_view() {
@@ -309,8 +312,7 @@ impl SymbolStore {
                             .unwrap_or("");
 
                         let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
-                        let storage_dir =
-                            get_storage_directory().ok_or("failed to get storage directory")?;
+                        let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
                         let path = storage_dir.join(&filename);
 
                         let job = DownloadJob {
@@ -321,9 +323,9 @@ impl SymbolStore {
                         download_pdb_single(&job)?;
 
                         let guid = guid_to_u128(image.Signature);
-                        let file = File::open(&path).map_err(|e| e.to_string())?;
+                        let file = File::open(&path)?;
 
-                        let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
+                        let mmap = unsafe { Mmap::map(&file)? };
                         let mmap = Arc::new(mmap);
                         let mmap_slice: &[u8] = &mmap;
 
@@ -332,21 +334,21 @@ impl SymbolStore {
                             unsafe { std::mem::transmute(mmap_slice) };
                         let cursor = Cursor::new(static_slice);
 
-                        let pdb = pdb::PDB::open(cursor).map_err(|e| e.to_string())?;
+                        let pdb = pdb::PDB::open(cursor)?;
 
                         self.mmaps.insert(guid, mmap);
                         self.pdbs.insert(guid, pdb.into());
 
                         self.build_index(guid);
 
-                        return Ok(guid_to_u128(image.Signature));
+                        return Ok(Some(guid_to_u128(image.Signature)));
                     }
                     _ => (),
                 }
             }
         }
 
-        Err("no debug symbols found in binary".into())
+        Ok(None)
     }
 
     pub fn has_guid(&self, guid: u128) -> bool {
@@ -357,19 +359,13 @@ impl SymbolStore {
         backend: &B,
         dtb: Dtb,
         base_address: VirtAddr,
-        name: &str,
-    ) -> Result<(DownloadJob, u128), String> {
+    ) -> Result<Option<(DownloadJob, u128)>> {
         let addr_space = memory::AddressSpace::new(backend, dtb);
-        let pe_image = crate::guest::read_pe_image(base_address, &addr_space)
-            .map_err(|e| format!("failed to read PE image for {}: {}", name, e))?;
+        let pe_image = crate::guest::read_pe_image(base_address, &addr_space)?;
 
-        let view = pelite::pe64::PeView::from_bytes(&pe_image)
-            .map_err(|e| format!("failed to parse PE for {}: {}", name, e))?;
+        let view = pelite::pe64::PeView::from_bytes(&pe_image)?;
 
-        let debug = view
-            .debug()
-            .ok()
-            .ok_or_else(|| format!("no debug section in {}", name))?;
+        let debug = view.debug()?;
 
         for entry in debug.iter().filter_map(|e| e.entry().ok()) {
             if let Some(cv) = entry.as_code_view() {
@@ -405,8 +401,7 @@ impl SymbolStore {
                             .unwrap_or("");
 
                         let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
-                        let storage_dir =
-                            get_storage_directory().ok_or("failed to get storage directory")?;
+                        let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
                         let path = storage_dir.join(&filename);
 
                         let guid = guid_to_u128(image.Signature);
@@ -416,14 +411,14 @@ impl SymbolStore {
                             filename: format!("{}.pdb", stem),
                         };
 
-                        return Ok((job, guid));
+                        return Ok(Some((job, guid)));
                     }
                     _ => (),
                 }
             }
         }
 
-        Err(format!("no debug symbols found in {}", name))
+        Ok(None)
     }
 
     pub fn load_downloaded_pdb(
@@ -434,25 +429,25 @@ impl SymbolStore {
         base_address: VirtAddr,
         size: u32,
         dtb: Dtb,
-    ) -> Result<u128, String> {
+    ) -> Result<u128> {
         if let Some(existing) = self.modules.get(&base_address.0) {
             return Ok(existing.guid);
         }
 
         if !self.pdbs.contains_key(&guid) {
             if !job.path.exists() {
-                return Err(format!("PDB file not found: {:?}", job.path));
+                return Err(Error::PdbNotFound(job.path.clone()));
             }
 
-            let file = File::open(&job.path).map_err(|e| e.to_string())?;
-            let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
+            let file = File::open(&job.path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
             let mmap = Arc::new(mmap);
             let mmap_slice: &[u8] = &mmap;
 
             let static_slice: &'static [u8] = unsafe { std::mem::transmute(mmap_slice) };
             let cursor = Cursor::new(static_slice);
 
-            let pdb = pdb::PDB::open(cursor).map_err(|e| e.to_string())?;
+            let pdb = pdb::PDB::open(cursor)?;
 
             self.mmaps.insert(guid, mmap);
             self.pdbs.insert(guid, pdb.into());
@@ -477,7 +472,7 @@ impl SymbolStore {
 
         for module in self.modules.values() {
             if let Some(filter_dtb) = dtb {
-                if module.dtb.0.0 != filter_dtb.0.0 {
+                if module.dtb != filter_dtb {
                     continue;
                 }
             }
@@ -511,7 +506,7 @@ impl SymbolStore {
 
         for module in self.modules.values() {
             if let Some(filter_dtb) = dtb {
-                if module.dtb.0.0 != filter_dtb.0.0 {
+                if module.dtb != filter_dtb {
                     continue;
                 }
             }
@@ -542,7 +537,7 @@ impl SymbolStore {
 
     pub fn find_type_across_modules(&self, dtb: Dtb, type_name: &str) -> Option<TypeInfo> {
         for module in self.modules.values() {
-            if module.dtb.0.0 != dtb.0.0 {
+            if module.dtb != dtb {
                 continue;
             }
             if let Some(type_info) = self.dump_struct_with_types(module.guid, type_name) {
@@ -554,7 +549,7 @@ impl SymbolStore {
 
     pub fn find_symbol_across_modules(&self, dtb: Dtb, symbol_name: &str) -> Option<VirtAddr> {
         for module in self.modules.values() {
-            if module.dtb.0.0 != dtb.0.0 {
+            if module.dtb != dtb {
                 continue;
             }
             if let Some(rva) = self.get_rva_of_symbol(module.guid, symbol_name) {
@@ -572,7 +567,7 @@ impl SymbolStore {
         use crate::guest::ModuleInfo;
 
         for module in self.modules.values() {
-            if module.dtb.0.0 != dtb.0.0 {
+            if module.dtb != dtb {
                 continue;
             }
 
@@ -662,7 +657,12 @@ impl SymbolStore {
     //     self.index_types.get(&guid).map(|v| Arc::new(v.clone()))
     // }
 
-    pub fn get_rva_of_symbol(&self, guid: u128, symbol_name: &str) -> Option<u32> {
+    pub fn get_rva_of_symbol<S>(&self, guid: u128, symbol_name: S) -> Option<u32>
+    where
+        S: AsRef<str>,
+    {
+        let symbol_name = symbol_name.as_ref();
+
         let pdb = self.pdbs.get(&guid)?;
         let mut pdb = pdb.borrow_mut();
         let symbol_table = pdb.global_symbols().ok()?;
@@ -676,7 +676,7 @@ impl SymbolStore {
                         return Some(data.offset.to_rva(&address_map).unwrap_or_default().0);
                     }
                 }
-                Ok(pdb::SymbolData::Data(data)) => {
+                Ok(pdb::SymbolData::Data(_data)) => {
                     // TODO does this need to also be checked?
                 }
                 _ => {}
@@ -916,7 +916,10 @@ impl SymbolStore {
         Ok(())
     }
 
-    pub fn dump_struct_with_types(&self, guid: u128, struct_name: &str) -> Option<TypeInfo> {
+    pub fn dump_struct_with_types<S>(&self, guid: u128, struct_name: S) -> Option<TypeInfo>
+    where
+        S: Into<String> + AsRef<str>,
+    {
         let pdb = self.pdbs.get(&guid)?;
         let mut pdb = pdb.borrow_mut();
 
@@ -928,15 +931,17 @@ impl SymbolStore {
             type_finder.update(&iter);
 
             if let Ok(TypeData::Class(class)) = typ.parse() {
-                if class.name.to_string() == struct_name && !class.properties.forward_reference() {
-                    let mut fields_map = HashMap::new();
+                if class.name.to_string() == struct_name.as_ref()
+                    && !class.properties.forward_reference()
+                {
+                    let mut fields_map: HashMap<String, FieldInfo> = HashMap::new();
                     if let Some(field_index) = class.fields {
                         self.process_field_list(&type_finder, field_index, &mut fields_map)
                             .ok()?;
                     }
 
                     return Some(TypeInfo {
-                        name: struct_name.to_string(),
+                        name: struct_name.into(),
                         size: class.size as usize,
                         fields: fields_map,
                     });

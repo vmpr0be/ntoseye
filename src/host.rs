@@ -7,10 +7,12 @@ use std::io::{IoSlice, IoSliceMut};
 use std::path::PathBuf;
 
 use crate::backend::MemoryOps;
+use crate::error::{Error, Result};
 use crate::types::PhysAddr;
 
 struct MemoryRegion {
     start: u64,
+    #[allow(dead_code)]
     end: u64,
     length: u64,
 }
@@ -38,8 +40,8 @@ pub struct KvmHandle {
  *    been exposed to begin with...
  */
 
-fn get_kvm_pid() -> Result<i32, String> {
-    for entry in fs::read_dir("/proc").map_err(|_| "failed to open /proc".to_string())? {
+fn get_kvm_pid() -> Result<i32> {
+    for entry in fs::read_dir("/proc")? {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -73,11 +75,11 @@ fn get_kvm_pid() -> Result<i32, String> {
         }
     }
 
-    Err("failed to find kvm".into())
+    Err(Error::KvmNotFound)
 }
 
-fn get_kvm_primary_memory(pid: i32) -> Result<MemoryRegion, String> {
-    let maps = File::open(format!("/proc/{}/maps", pid)).map_err(|_| "failed to open kvm maps")?;
+fn get_kvm_primary_memory(pid: i32) -> Result<MemoryRegion> {
+    let maps = File::open(format!("/proc/{}/maps", pid))?;
     let reader = BufReader::new(maps);
 
     let region = reader
@@ -104,12 +106,13 @@ fn get_kvm_primary_memory(pid: i32) -> Result<MemoryRegion, String> {
             })
         })
         .max_by_key(|region| region.length)
-        .ok_or("no memory regions found in kvm")?;
+        .ok_or(Error::NoKvmRegions)?;
 
     Ok(region)
 }
 
-fn kfix(x: u64) -> u64 {
+// "Translate" guest's physical address to host's address within the memory map
+fn gpa2hva(x: PhysAddr) -> u64 {
     if x < 0x80000000 {
         return x;
     }
@@ -118,7 +121,7 @@ fn kfix(x: u64) -> u64 {
 }
 
 impl KvmHandle {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self> {
         let pid = get_kvm_pid()?;
         let memory = get_kvm_primary_memory(pid)?;
 
@@ -130,31 +133,27 @@ impl KvmHandle {
 }
 
 impl MemoryOps<PhysAddr> for KvmHandle {
-    fn read_bytes(&self, addr: PhysAddr, buf: &mut [u8]) -> Result<usize, String> {
+    fn read_bytes(&self, addr: PhysAddr, buf: &mut [u8]) -> Result<usize> {
         let remote_iov = RemoteIoVec {
-            base: (self.memory.start + kfix(addr.0)) as usize,
+            base: (self.memory.start + gpa2hva(addr)) as usize,
             len: buf.len(),
         };
 
         let local_iov = IoSliceMut::new(buf);
 
-        process_vm_readv(self.pid, &mut [local_iov], &[remote_iov]).map_err(|e| {
-            format!(
-                "could not read physical address {:x} ({})",
-                addr.0,
-                e.to_string()
-            )
-        })
+        let bytes_read = process_vm_readv(self.pid, &mut [local_iov], &[remote_iov])?;
+        Ok(bytes_read)
     }
 
-    fn write_bytes(&self, addr: PhysAddr, buf: &[u8]) -> Result<usize, String> {
+    fn write_bytes(&self, addr: PhysAddr, buf: &[u8]) -> Result<usize> {
         let remote_iov = RemoteIoVec {
-            base: (self.memory.start + kfix(addr.0)) as usize,
+            base: (self.memory.start + gpa2hva(addr)) as usize,
             len: buf.len(),
         };
 
         let local_iov = IoSlice::new(buf);
 
-        process_vm_writev(self.pid, &mut [local_iov], &[remote_iov]).map_err(|e| e.to_string())
+        let bytes_read = process_vm_writev(self.pid, &mut [local_iov], &[remote_iov])?;
+        Ok(bytes_read)
     }
 }
