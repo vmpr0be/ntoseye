@@ -475,9 +475,8 @@ impl Guest {
             }
             visited.insert(current_eprocess.0);
 
-            let pid: u64 = memory.read(current_eprocess + unique_process_id_offset)?;
-            let mut dtb: Dtb = memory.read(current_eprocess + dir_table_base_offset)?;
-            dtb &= !0xfff;
+            let pid = memory.read::<u64>(current_eprocess + unique_process_id_offset)?;
+            let dtb = memory.read::<Dtb>(current_eprocess + dir_table_base_offset)? & !0xfff;
 
             if dtb == 0 {
                 break;
@@ -517,7 +516,7 @@ impl Guest {
                 eprocess_va: current_eprocess,
             });
 
-            let flink: VirtAddr = memory.read(current_eprocess + active_process_links_offset)?;
+            let flink = memory.read::<VirtAddr>(current_eprocess + active_process_links_offset)?;
             if flink.0 == 0 {
                 break;
             }
