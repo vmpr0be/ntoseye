@@ -19,12 +19,60 @@ pub struct AddressSpace<'a, B: MemoryOps<PhysAddr>> {
     dtb: Dtb,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PteLevel {
-    Pte = 1,
-    Pde,
-    Pdpte,
-    Pml4e,
+pub struct Translation {
+    #[allow(dead_code)]
+    pub address: PhysAddr,
+    #[allow(dead_code)]
+    pub large: bool,
+    pub writable: bool,
+    pub user: bool,
+    pub nx: bool,
+}
+
+impl Translation {
+    pub const fn new_huge(pml4e: PageTableEntry, pdpte: PageTableEntry, va: VirtAddr) -> Self {
+        Self {
+            address: pdpte.page_frame() + va.huge_page_offset(),
+            large: true,
+            writable: pml4e.is_writable() && pdpte.is_writable(),
+            user: pml4e.is_user() && pdpte.is_user(),
+            nx: pml4e.is_nx() || pdpte.is_nx(),
+        }
+    }
+
+    pub const fn new_large(
+        pml4e: PageTableEntry,
+        pdpte: PageTableEntry,
+        pde: PageTableEntry,
+        va: VirtAddr,
+    ) -> Self {
+        Self {
+            address: pde.page_frame() + va.large_page_offset(),
+            large: true,
+            writable: pml4e.is_writable() && pdpte.is_writable() && pdpte.is_user(),
+            user: pml4e.is_user() && pdpte.is_user() && pde.is_user(),
+            nx: pml4e.is_nx() || pdpte.is_nx() || pde.is_nx(),
+        }
+    }
+
+    pub const fn new(
+        pml4e: PageTableEntry,
+        pdpte: PageTableEntry,
+        pde: PageTableEntry,
+        pte: PageTableEntry,
+        va: VirtAddr,
+    ) -> Self {
+        Self {
+            address: pte.page_frame() + va.page_offset(),
+            large: false,
+            writable: pml4e.is_writable()
+                && pdpte.is_writable()
+                && pde.is_writable()
+                && pte.is_writable(),
+            user: pml4e.is_user() && pdpte.is_user() && pde.is_user() && pte.is_user(),
+            nx: pml4e.is_nx() || pdpte.is_nx() || pde.is_nx() || pte.is_nx(),
+        }
+    }
 }
 
 impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
@@ -36,47 +84,53 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
         self.backend.read(table_base + 8 * index as u64)
     }
 
-    pub fn virt_to_phys(&self, vaddr: VirtAddr) -> Result<PhysAddr> {
-        let pml4e = self.read_pt_entry(self.dtb, vaddr.pml4_index())?;
+    pub fn virt_to_phys(&self, va: VirtAddr) -> Result<Option<Translation>> {
+        let pml4e = self.read_pt_entry(self.dtb, va.pml4_index())?;
         if !pml4e.is_present() {
-            return Err(Error::PTEntryNotPresent(PteLevel::Pml4e));
+            return Ok(None);
         }
 
-        let pdpte = self.read_pt_entry(pml4e.page_frame(), vaddr.pdpt_index())?;
+        let pdpte = self.read_pt_entry(pml4e.page_frame(), va.pdpt_index())?;
         if !pdpte.is_present() {
-            return Err(Error::PTEntryNotPresent(PteLevel::Pdpte));
+            return Ok(None);
         }
 
         if pdpte.is_large_page() {
-            return Ok(pdpte.page_frame() + vaddr.huge_page_offset());
+            return Ok(Some(Translation::new_huge(pml4e, pdpte, va)));
         }
 
-        let pde = self.read_pt_entry(pdpte.page_frame(), vaddr.pd_index())?;
+        let pde = self.read_pt_entry(pdpte.page_frame(), va.pd_index())?;
         if !pde.is_present() {
-            return Err(Error::PTEntryNotPresent(PteLevel::Pde));
+            return Ok(None);
         }
 
         if pde.is_large_page() {
-            return Ok(pde.page_frame() + vaddr.large_page_offset());
+            return Ok(Some(Translation::new_large(pml4e, pdpte, pde, va)));
         }
 
-        let pte = self.read_pt_entry(pde.page_frame(), vaddr.pt_index())?;
+        let pte = self.read_pt_entry(pde.page_frame(), va.pt_index())?;
         if !pte.is_present() {
-            return Err(Error::PTEntryNotPresent(PteLevel::Pte));
+            return Ok(None);
         }
 
-        Ok(pte.page_frame() + vaddr.page_offset())
+        Ok(Some(Translation::new(pml4e, pdpte, pde, pte, va)))
     }
 }
 
 impl<'a, B: MemoryOps<PhysAddr>> MemoryOps<VirtAddr> for AddressSpace<'a, B> {
     fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<usize> {
-        let paddr = self.virt_to_phys(addr)?;
-        self.backend.read_bytes(paddr, buf)
+        let xlat = self
+            .virt_to_phys(addr)?
+            .ok_or(Error::BadVirtualAddress(addr))?;
+
+        self.backend.read_bytes(xlat.address, buf)
     }
 
     fn write_bytes(&self, addr: VirtAddr, buf: &[u8]) -> Result<usize> {
-        let paddr = self.virt_to_phys(addr)?;
-        self.backend.write_bytes(paddr, buf)
+        let xlat = self
+            .virt_to_phys(addr)?
+            .ok_or(Error::BadVirtualAddress(addr))?;
+
+        self.backend.write_bytes(xlat.address, buf)
     }
 }

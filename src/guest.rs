@@ -2,7 +2,7 @@ use crate::{
     backend::MemoryOps,
     error::{Error, Result},
     host::KvmHandle,
-    memory::{self, PAGE_SIZE},
+    memory::{self, AddressSpace, PAGE_SIZE},
     symbols::{SymbolStore, TypeInfo},
     types::*,
 };
@@ -197,94 +197,6 @@ pub struct Guest {
     pub ntoskrnl: WinObject,
 }
 
-pub struct Translation {
-    #[allow(dead_code)]
-    address: PhysAddr,
-    #[allow(dead_code)]
-    large: bool,
-    writable: bool,
-    user: bool,
-    nx: bool,
-}
-
-impl Translation {
-    pub const fn new_huge(pml4e: PageTableEntry, pdpte: PageTableEntry, va: VirtAddr) -> Self {
-        Self {
-            address: pdpte.page_frame() + va.huge_page_offset(),
-            large: true,
-            writable: pml4e.is_writable() && pdpte.is_writable(),
-            user: pml4e.is_user() && pdpte.is_user(),
-            nx: pml4e.is_nx() || pdpte.is_nx(),
-        }
-    }
-
-    pub const fn new_large(
-        pml4e: PageTableEntry,
-        pdpte: PageTableEntry,
-        pde: PageTableEntry,
-        va: VirtAddr,
-    ) -> Self {
-        Self {
-            address: pde.page_frame() + va.large_page_offset(),
-            large: true,
-            writable: pml4e.is_writable() && pdpte.is_writable() && pdpte.is_user(),
-            user: pml4e.is_user() && pdpte.is_user() && pde.is_user(),
-            nx: pml4e.is_nx() || pdpte.is_nx() || pde.is_nx(),
-        }
-    }
-
-    pub const fn new(
-        pml4e: PageTableEntry,
-        pdpte: PageTableEntry,
-        pde: PageTableEntry,
-        pte: PageTableEntry,
-        va: VirtAddr,
-    ) -> Self {
-        Self {
-            address: pte.page_frame() + va.page_offset(),
-            large: false,
-            writable: pml4e.is_writable()
-                && pdpte.is_writable()
-                && pde.is_writable()
-                && pte.is_writable(),
-            user: pml4e.is_user() && pdpte.is_user() && pde.is_user() && pte.is_user(),
-            nx: pml4e.is_nx() || pdpte.is_nx() || pde.is_nx() || pte.is_nx(),
-        }
-    }
-}
-
-fn translate_virt2phys(kvm: &KvmHandle, dtb: Dtb, va: VirtAddr) -> Result<Option<Translation>> {
-    let pml4e = kvm.read::<PageTableEntry>(dtb + va.pml4_index() as u64 * 8)?;
-    if !pml4e.is_present() {
-        return Ok(None);
-    }
-
-    let pdpte = kvm.read::<PageTableEntry>(pml4e.page_frame() + va.pdpt_index() as u64 * 8)?;
-    if !pdpte.is_present() {
-        return Ok(None);
-    }
-
-    if pdpte.is_large_page() {
-        return Ok(Some(Translation::new_huge(pml4e, pdpte, va)));
-    }
-
-    let pde = kvm.read::<PageTableEntry>(pdpte.page_frame() + va.pd_index() as u64 * 8)?;
-    if !pde.is_present() {
-        return Ok(None);
-    }
-
-    if pde.is_large_page() {
-        return Ok(Some(Translation::new_large(pml4e, pdpte, pde, va)));
-    }
-
-    let pte = kvm.read::<PageTableEntry>(pde.page_frame() + va.pt_index() as u64 * 8)?;
-    if !pte.is_present() {
-        return Ok(None);
-    }
-
-    Ok(Some(Translation::new(pml4e, pdpte, pde, pte, va)))
-}
-
 fn is_valid_kernel_dtb(kvm: &KvmHandle, dtb: Dtb) -> Result<bool> {
     let kernel_pml4 = kvm.read::<[PageTableEntry; 256]>(dtb + 8 * 256)?;
 
@@ -300,7 +212,9 @@ fn is_valid_kernel_dtb(kvm: &KvmHandle, dtb: Dtb) -> Result<bool> {
     // Check if use KUSER_SHARED_DATA is mapped
     const KUSER_SHARED_DATA_VA: VirtAddr = VirtAddr::from_u64(0xfffff78000000000);
 
-    let Some(xlat) = translate_virt2phys(kvm, dtb, KUSER_SHARED_DATA_VA)? else {
+    let addr_space = AddressSpace::new(kvm, dtb);
+
+    let Some(xlat) = addr_space.virt_to_phys(KUSER_SHARED_DATA_VA)? else {
         return Ok(false);
     };
 

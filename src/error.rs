@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::{memory::PteLevel, types::VirtAddr};
+use crate::types::VirtAddr;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -98,14 +98,14 @@ pub enum Error {
     #[error("Another instance of ntoseye is running")]
     AlreadyRunning,
 
-    #[error("Page table entry not present at level '{0:?}'")]
-    PTEntryNotPresent(PteLevel),
-
     #[error("Data doesn't find in buffer")]
     BufferNotEnough,
 
     #[error("Invalid range")]
     InvalidRange,
+
+    #[error("Bad virtual address: {0:x}")]
+    BadVirtualAddress(VirtAddr),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
