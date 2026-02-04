@@ -317,19 +317,43 @@ fn find_kernel_dtb(kvm: &KvmHandle) -> Result<Option<Dtb>> {
     Ok(None)
 }
 
+fn is_ntoskrnl_pte(kvm: &KvmHandle, pte: PageTableEntry) -> Result<bool> {
+    if pte.is_user() || !pte.is_nx() {
+        return Ok(false);
+    }
+
+    let header = kvm.read::<[u8; 0x1000]>(pte.page_frame())?;
+
+    if header[..4] != [0x4d, 0x5a, 0x90, 0x00] {
+        return Ok(false);
+    }
+
+    for chunk in header.chunks_exact(8) {
+        if chunk != b"POOLCODE" {
+            continue;
+        }
+
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>> {
     const KERNEL_VA_MIN: VirtAddr = VirtAddr::from_u64(0xfffff80000000000);
     const KERNEL_VA_MAX: VirtAddr = VirtAddr::from_u64(0xfffff80800000000);
 
     let pml4e_count = KERNEL_VA_MAX.pml4_index() - KERNEL_VA_MIN.pml4_index() + 1;
 
-    let kernel_pml4 = kvm.read::<[PageTableEntry; 512]>(kernel_dtb)?;
-    for (pml4_index, pml4e) in kernel_pml4
+    let kernel_pml4 = kvm.read::<[PageTableEntry; 256]>(kernel_dtb + 8 * 256)?;
+    for (rel_pml4_index, pml4e) in kernel_pml4
         .into_iter()
         .enumerate()
-        .skip(KERNEL_VA_MIN.pml4_index())
+        .skip(KERNEL_VA_MIN.pml4_index() - 256)
         .take(pml4e_count)
     {
+        let pml4_index = 256 + rel_pml4_index;
+
         if !pml4e.is_present() {
             continue;
         }
@@ -347,6 +371,11 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>
             }
 
             if pdpte.is_large_page() {
+                // Unlikely but just making sure
+                if is_ntoskrnl_pte(kvm, pdpte)? {
+                    return Ok(Some(VirtAddr::construct(pml4_index, pdpt_index, 0, 0)));
+                }
+
                 continue;
             }
 
@@ -364,6 +393,12 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>
                 }
 
                 if pde.is_large_page() {
+                    if is_ntoskrnl_pte(kvm, pde)? {
+                        return Ok(Some(VirtAddr::construct(
+                            pml4_index, pdpt_index, pd_index, 0,
+                        )));
+                    }
+
                     continue;
                 }
 
@@ -376,26 +411,13 @@ fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>
                 };
 
                 for (pt_index, pte) in pt.into_iter().take(pte_count).enumerate() {
-                    if !pte.is_present() {
+                    if !pte.is_present() || !is_ntoskrnl_pte(kvm, pte)? {
                         continue;
                     }
 
-                    if pte.is_writable() && !pte.is_user() && pte.is_nx() {
-                        let phys = pte.page_frame();
-                        let header = kvm.read::<[u8; 0x1000]>(phys)?;
-
-                        if header[..4] != [0x4d, 0x5a, 0x90, 0x00] {
-                            continue;
-                        }
-
-                        for chunk in header.chunks_exact(8) {
-                            if chunk == b"POOLCODE" {
-                                let va =
-                                    VirtAddr::construct(pml4_index, pdpt_index, pd_index, pt_index);
-                                return Ok(Some(va));
-                            }
-                        }
-                    }
+                    return Ok(Some(VirtAddr::construct(
+                        pml4_index, pdpt_index, pd_index, pt_index,
+                    )));
                 }
             }
         }
