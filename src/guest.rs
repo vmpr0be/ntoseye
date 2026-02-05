@@ -217,11 +217,13 @@ fn is_valid_kernel_dtb(kvm: &KvmHandle, dtb: Dtb) -> Result<bool> {
 
     let addr_space = AddressSpace::new(kvm, dtb);
 
-    let Some(xlat) = addr_space.virt_to_phys(KUSER_SHARED_DATA_VA)? else {
-        return Ok(false);
-    };
-
-    Ok(xlat.nx)
+    if let Some(xlat) = addr_space.virt_to_phys(KUSER_SHARED_DATA_VA)?
+        && !xlat.user
+        && xlat.nx {
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 fn find_kernel_dtb(kvm: &KvmHandle) -> Result<Option<Dtb>> {
