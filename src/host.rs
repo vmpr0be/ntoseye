@@ -131,27 +131,45 @@ impl KvmHandle {
 }
 
 impl MemoryOps<PhysAddr> for KvmHandle {
-    fn read_bytes(&self, addr: PhysAddr, buf: &mut [u8]) -> Result<usize> {
+    fn read_bytes(&self, addr: PhysAddr, buf: &mut [u8]) -> Result<()> {
+        let hva = self.memory.start + gpa2hva(addr);
+        if hva + buf.len() as u64 > self.memory.end {
+            return Err(Error::BadPhysicalAddress(addr));
+        }
+
         let remote_iov = RemoteIoVec {
-            base: (self.memory.start + gpa2hva(addr)) as usize,
+            base: hva as usize,
             len: buf.len(),
         };
 
         let local_iov = IoSliceMut::new(buf);
 
         let bytes_read = process_vm_readv(self.pid, &mut [local_iov], &[remote_iov])?;
-        Ok(bytes_read)
+        if bytes_read != buf.len() {
+            return Err(Error::PartialRead(bytes_read));
+        }
+
+        Ok(())
     }
 
-    fn write_bytes(&self, addr: PhysAddr, buf: &[u8]) -> Result<usize> {
+    fn write_bytes(&self, addr: PhysAddr, buf: &[u8]) -> Result<()> {
+        let hva = self.memory.start + gpa2hva(addr);
+        if hva + buf.len() as u64 > self.memory.end {
+            return Err(Error::BadPhysicalAddress(addr));
+        }
+
         let remote_iov = RemoteIoVec {
-            base: (self.memory.start + gpa2hva(addr)) as usize,
+            base: hva as usize,
             len: buf.len(),
         };
 
         let local_iov = IoSlice::new(buf);
 
-        let bytes_read = process_vm_writev(self.pid, &[local_iov], &[remote_iov])?;
-        Ok(bytes_read)
+        let bytes_written = process_vm_writev(self.pid, &[local_iov], &[remote_iov])?;
+        if bytes_written != buf.len() {
+            return Err(Error::PartialWrite(bytes_written));
+        }
+
+        Ok(())
     }
 }

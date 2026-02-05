@@ -49,7 +49,7 @@ impl Translation {
         Self {
             address: pde.page_frame() + va.large_page_offset(),
             large: true,
-            writable: pml4e.is_writable() && pdpte.is_writable() && pdpte.is_user(),
+            writable: pml4e.is_writable() && pdpte.is_writable() && pdpte.is_writable(),
             user: pml4e.is_user() && pdpte.is_user() && pde.is_user(),
             nx: pml4e.is_nx() || pdpte.is_nx() || pde.is_nx(),
         }
@@ -118,7 +118,7 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
 }
 
 impl<'a, B: MemoryOps<PhysAddr>> MemoryOps<VirtAddr> for AddressSpace<'a, B> {
-    fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<usize> {
+    fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<()> {
         let xlat = self
             .virt_to_phys(addr)?
             .ok_or(Error::BadVirtualAddress(addr))?;
@@ -126,7 +126,7 @@ impl<'a, B: MemoryOps<PhysAddr>> MemoryOps<VirtAddr> for AddressSpace<'a, B> {
         self.backend.read_bytes(xlat.address, buf)
     }
 
-    fn write_bytes(&self, addr: VirtAddr, buf: &[u8]) -> Result<usize> {
+    fn write_bytes(&self, addr: VirtAddr, buf: &[u8]) -> Result<()> {
         let xlat = self
             .virt_to_phys(addr)?
             .ok_or(Error::BadVirtualAddress(addr))?;

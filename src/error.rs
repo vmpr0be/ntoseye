@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::types::VirtAddr;
+use crate::types::{PhysAddr, VirtAddr};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -14,7 +14,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
-    Pdb(#[from] pdb::Error),
+    Pdb2(#[from] pdb2::Error),
 
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
@@ -33,7 +33,7 @@ pub enum Error {
 
     #[error(transparent)]
     CtrlC(#[from] ctrlc::Error),
-
+    
     #[error("GDB protocol failure: {0}")]
     Rsp(String),
 
@@ -104,8 +104,17 @@ pub enum Error {
     #[error("Invalid range")]
     InvalidRange,
 
+    #[error("Partial read: {0}b")]
+    PartialRead(usize),
+
+    #[error("Partial write: {0}b")]
+    PartialWrite(usize),
+
     #[error("Bad virtual address: {0:x}")]
     BadVirtualAddress(VirtAddr),
+
+    #[error("Bad physical address '{0:x}'")]
+    BadPhysicalAddress(PhysAddr),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

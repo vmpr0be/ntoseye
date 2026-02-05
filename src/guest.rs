@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
@@ -8,6 +10,7 @@ use crate::{
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use pelite::pe64::{Pe, PeView};
+use rayon::prelude::*;
 use zerocopy::IntoBytes;
 
 /// used for enumeration without loading full WinObject
@@ -750,7 +753,7 @@ impl Guest {
 
         let mut jobs_with_info: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
         let mut already_loaded: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
-        let mut loaded = 0;
+        let loaded = AtomicUsize::new(0);
 
         for module in &modules {
             if Self::is_session_space(module.base_address) {
@@ -780,8 +783,12 @@ impl Guest {
                     .progress_chars("#-"),
             );
 
-            for (job, guid, module) in already_loaded.into_iter().chain(jobs_with_info.into_iter())
-            {
+            let all_jobs = already_loaded
+                .into_iter()
+                .chain(jobs_with_info.into_iter())
+                .collect::<Vec<_>>();
+
+            all_jobs.into_par_iter().for_each(|(job, guid, module)| {
                 if symbols
                     .load_downloaded_pdb(
                         &job,
@@ -793,15 +800,15 @@ impl Guest {
                     )
                     .is_ok()
                 {
-                    loaded += 1;
+                    loaded.fetch_add(1, Ordering::Relaxed);
                 }
                 pb.inc(1);
-            }
+            });
 
             pb.finish_and_clear();
         }
 
-        Ok(loaded)
+        Ok(loaded.load(Ordering::Relaxed))
     }
 
     pub fn load_all_process_module_symbols(
@@ -817,7 +824,7 @@ impl Guest {
 
         let mut jobs_with_info: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
         let mut already_loaded: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
-        let mut loaded = 0;
+        let loaded = AtomicUsize::new(0);
 
         for module in &modules {
             if let Ok(Some((job, guid))) =
@@ -843,11 +850,16 @@ impl Guest {
                     .progress_chars("#-"),
             );
 
-            for (job, guid, module) in already_loaded.iter().chain(jobs_with_info.iter()) {
+            let all_jobs = already_loaded
+                .into_iter()
+                .chain(jobs_with_info.into_iter())
+                .collect::<Vec<_>>();
+
+            all_jobs.into_par_iter().for_each(|(job, guid, module)| {
                 if symbols
                     .load_downloaded_pdb(
-                        job,
-                        *guid,
+                        &job,
+                        guid,
                         &module.name,
                         module.base_address,
                         module.size,
@@ -855,14 +867,15 @@ impl Guest {
                     )
                     .is_ok()
                 {
-                    loaded += 1;
+                    loaded.fetch_add(1, Ordering::Relaxed);
                 }
+
                 pb.inc(1);
-            }
+            });
 
             pb.finish_and_clear();
         }
 
-        Ok(loaded)
+        Ok(loaded.load(Ordering::Relaxed))
     }
 }
