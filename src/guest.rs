@@ -221,7 +221,7 @@ fn is_valid_kernel_dtb(kvm: &KvmHandle, dtb: Dtb) -> Result<bool> {
         return Ok(false);
     };
 
-    Ok(!xlat.writable && !xlat.user && xlat.nx)
+    Ok(xlat.nx)
 }
 
 fn find_kernel_dtb(kvm: &KvmHandle) -> Result<Option<Dtb>> {

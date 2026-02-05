@@ -33,7 +33,7 @@ pub enum Error {
 
     #[error(transparent)]
     CtrlC(#[from] ctrlc::Error),
-    
+
     #[error("GDB protocol failure: {0}")]
     Rsp(String),
 
@@ -113,7 +113,7 @@ pub enum Error {
     #[error("Bad virtual address: {0:x}")]
     BadVirtualAddress(VirtAddr),
 
-    #[error("Bad physical address '{0:x}'")]
+    #[error("Bad physical address: {0:x}")]
     BadPhysicalAddress(PhysAddr),
 }
 

@@ -24,7 +24,9 @@ pub struct Translation {
     pub address: PhysAddr,
     #[allow(dead_code)]
     pub large: bool,
+    #[allow(dead_code)]
     pub writable: bool,
+    #[allow(dead_code)]
     pub user: bool,
     pub nx: bool,
 }
