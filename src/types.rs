@@ -1,115 +1,175 @@
-use owo_colors::OwoColorize;
-use std::{
-    fmt,
-    ops::{Add, BitAnd, BitOr, Shr, Sub},
+use crate::memory::{
+    PAGE_SHIFT, PDE_SHIFT, PDPTE_SHIFT, PFN_MASK, PML4E_SHIFT, PT_INDEX_MASK, PTE_SHIFT,
 };
+use owo_colors::OwoColorize;
+use std::fmt;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-#[derive(Clone, Copy, Debug, PartialEq, FromBytes, IntoBytes, Immutable)]
+#[derive(
+    Default,
+    Clone,
+    Copy,
+    FromBytes,
+    IntoBytes,
+    Immutable,
+    Debug,
+    PartialEq,
+    Eq,
+    derive_more::From,
+    derive_more::Into,
+    derive_more::Add,
+    derive_more::Sub,
+    derive_more::AddAssign,
+    derive_more::SubAssign,
+    derive_more::BitAnd,
+    derive_more::BitOr,
+    derive_more::FromStr,
+    derive_more::Constructor,
+    PartialOrd,
+)]
+#[repr(transparent)]
 pub struct VirtAddr(pub u64);
+
+impl From<u32> for VirtAddr {
+    fn from(value: u32) -> Self {
+        VirtAddr::from_u64(value as u64)
+    }
+}
+
+impl std::ops::AddAssign<u64> for VirtAddr {
+    fn add_assign(&mut self, rhs: u64) {
+        *self += VirtAddr(rhs);
+    }
+}
+
+impl std::ops::SubAssign<u64> for VirtAddr {
+    fn sub_assign(&mut self, rhs: u64) {
+        *self -= VirtAddr(rhs);
+    }
+}
+
+impl std::ops::Add<u64> for VirtAddr {
+    type Output = Self;
+
+    fn add(self, rhs: u64) -> Self::Output {
+        self + VirtAddr(rhs)
+    }
+}
+
+impl std::ops::Sub<u64> for VirtAddr {
+    type Output = Self;
+
+    fn sub(self, rhs: u64) -> Self::Output {
+        self - VirtAddr(rhs)
+    }
+}
+
+impl std::ops::Add<u32> for VirtAddr {
+    type Output = Self;
+
+    fn add(self, rhs: u32) -> Self::Output {
+        self + VirtAddr::from(rhs)
+    }
+}
+
+impl std::ops::Sub<u32> for VirtAddr {
+    type Output = Self;
+
+    fn sub(self, rhs: u32) -> Self::Output {
+        self - VirtAddr::from(rhs)
+    }
+}
 
 pub type PhysAddr = u64;
 
 pub type Dtb = PhysAddr;
 
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
 pub struct PageTableEntry(pub u64);
 
 impl VirtAddr {
-    pub fn is_zero(&self) -> bool {
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn construct(
+        pml4_index: usize,
+        pdpt_index: usize,
+        pd_index: usize,
+        pt_index: usize,
+    ) -> Self {
+        let mut addr = ((pml4_index << PML4E_SHIFT)
+            | (pdpt_index << PDPTE_SHIFT)
+            | (pd_index << PDE_SHIFT)
+            | (pt_index << PTE_SHIFT)) as u64;
+
+        if pml4_index >= 256 {
+            addr |= 0xffff_0000_0000_0000;
+        }
+
+        Self(addr)
+    }
+
+    pub const fn is_zero(&self) -> bool {
         self.0 == 0
     }
-}
 
-impl Add<u64> for VirtAddr {
-    type Output = Self;
-    fn add(self, rhs: u64) -> Self {
-        VirtAddr(self.0 + rhs)
-    }
-}
-
-impl Sub<u64> for VirtAddr {
-    type Output = Self;
-    fn sub(self, rhs: u64) -> Self {
-        VirtAddr(self.0 - rhs)
-    }
-}
-
-impl BitAnd<u64> for VirtAddr {
-    type Output = Self;
-    fn bitand(self, rhs: u64) -> Self {
-        VirtAddr(self.0 & rhs)
-    }
-}
-
-impl BitOr<u64> for VirtAddr {
-    type Output = Self;
-    fn bitor(self, rhs: u64) -> Self {
-        VirtAddr(self.0 | rhs)
-    }
-}
-
-impl Shr<u64> for VirtAddr {
-    type Output = Self;
-    fn shr(self, rhs: u64) -> Self {
-        VirtAddr(self.0 >> rhs)
-    }
-}
-
-impl VirtAddr {
-    pub fn pml4e_index(self) -> u64 {
-        (self.0 >> 39) & 0x1ff
+    pub const fn huge_page_offset(self) -> u64 {
+        self.0 & !(!0u64 << 30)
     }
 
-    pub fn pdpte_index(self) -> u64 {
-        (self.0 >> 30) & 0x1ff
+    pub const fn large_page_offset(self) -> u64 {
+        self.0 & !(!0u64 << 21)
     }
 
-    pub fn pde_index(self) -> u64 {
-        (self.0 >> 21) & 0x1ff
+    pub const fn pml4_index(self) -> usize {
+        ((self.0 >> PML4E_SHIFT) & PT_INDEX_MASK) as usize
     }
 
-    pub fn pte_index(self) -> u64 {
-        (self.0 >> 12) & 0x1ff
+    pub const fn pdpt_index(self) -> usize {
+        ((self.0 >> PDPTE_SHIFT) & PT_INDEX_MASK) as usize
     }
 
-    pub fn page_offset(self) -> u64 {
-        const PAGE_OFFSET_SIZE: u32 = 12;
-        self.0 & !(!0 << PAGE_OFFSET_SIZE)
+    pub const fn pd_index(self) -> usize {
+        ((self.0 >> PDE_SHIFT) & PT_INDEX_MASK) as usize
+    }
+
+    pub const fn pt_index(self) -> usize {
+        ((self.0 >> PTE_SHIFT) & PT_INDEX_MASK) as usize
+    }
+
+    pub const fn page_offset(self) -> u64 {
+        self.0 & !(!0 << PAGE_SHIFT)
     }
 }
 
 impl PageTableEntry {
-    pub fn is_present(self) -> bool {
+    pub const fn is_present(self) -> bool {
         self.0 & 1 != 0
     }
 
-    pub fn is_large_page(self) -> bool {
+    pub const fn is_large_page(self) -> bool {
         self.0 & 0x80 != 0
     }
 
-    pub fn pte_frame_addr(self) -> u64 {
-        self.0 & 0x0000_ffff_ffff_f000u64
+    pub const fn page_frame(self) -> u64 {
+        self.0 & PFN_MASK
     }
 
-    pub fn is_zero(self) -> bool {
-        self.0 == 0
+    pub const fn is_user(self) -> bool {
+        self.0 & 0x4 != 0
     }
 
-    pub fn is_kernel_table(self) -> bool {
-        // TODO split up into:
-        // is_present, is_writable, is_user, is_large_page, nx
-        (self.0 & 0x8000000000000087) == 0x03
+    pub const fn is_nx(self) -> bool {
+        self.0 & (1 << 63) != 0
     }
 
-    pub fn is_self_ref(self, pa: u64) -> bool {
-        (self.0 & 0x0000fffffffff083) == (pa | 0x03)
+    pub const fn is_writable(self) -> bool {
+        self.0 & 0x2 != 0
     }
 
-    pub fn pfn(self) -> u64 {
-        // Page Frame Number is the physical address shifted right by 12 bits (4KB page size)
-        self.pte_frame_addr() >> 12
-        // (self.0 >> 12) & 0x0000_000f_ffff_ffff
+    pub const fn pfn(self) -> u64 {
+        self.page_frame() >> 12
     }
 
     pub fn flags(self) -> String {

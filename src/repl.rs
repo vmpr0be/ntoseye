@@ -548,10 +548,10 @@ fn hexdump(start_address: VirtAddr, data: &[u8]) {
             }
         }
 
-        println!("");
+        println!();
     }
 
-    println!("");
+    println!();
 }
 
 struct TrackingHighlighter {
@@ -700,7 +700,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
         let sig = line_editor.read_line(&prompt)?;
         match sig {
             Signal::Success(buffer) => {
-                let parts: Vec<&str> = buffer.trim().split_whitespace().collect();
+                let parts: Vec<&str> = buffer.split_whitespace().collect();
                 if let Some(cmd_str) = parts.first() {
                     match ReplCommand::from_str(cmd_str) {
                         Ok(ReplCommand::Quit) => {
@@ -848,9 +848,9 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                     print!("{}", format!(" ; {}", sym).bright_black());
                                 }
 
-                                println!("");
+                                println!();
                             }
-                            println!("");
+                            println!();
                         }
                         Ok(ReplCommand::Lt) => {
                             if client.is_running {
@@ -1167,21 +1167,21 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                                 ParsedType::Primitive(p) => {
                                                     if p.contains("*") || p.contains("LONGLONG") {
                                                         let val: u64 =
-                                                            mem.read(address + info.offset.into())?;
+                                                            mem.read(address + info.offset)?;
                                                         format!(" = {:#x}", Value(val))
                                                     } else if p.contains("LONG") {
                                                         let val: u32 =
-                                                            mem.read(address + info.offset.into())?;
+                                                            mem.read(address + info.offset)?;
                                                         format!(" = {:#x}", Value(val))
                                                     } else if p.contains("SHORT")
                                                         || p.contains("WCHAR")
                                                     {
                                                         let val: u16 =
-                                                            mem.read(address + info.offset.into())?;
+                                                            mem.read(address + info.offset)?;
                                                         format!(" = {:#x}", Value(val))
                                                     } else if p.contains("CHAR") {
                                                         let val: u8 =
-                                                            mem.read(address + info.offset.into())?;
+                                                            mem.read(address + info.offset)?;
                                                         format!(" = {:#x}", Value(val))
                                                     } else {
                                                         "".into()
@@ -1189,12 +1189,12 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                                 }
                                                 ParsedType::Pointer(_) => {
                                                     let val: u64 =
-                                                        mem.read(address + info.offset.into())?;
+                                                        mem.read(address + info.offset)?;
                                                     format!(" = {:#x}", Value(val))
                                                 }
                                                 ParsedType::Bitfield { pos, len, .. } => {
                                                     let val: u64 =
-                                                        mem.read(address + info.offset.into())?;
+                                                        mem.read(address + info.offset)?;
                                                     let val = (val >> pos) & ((1u64 << len) - 1);
 
                                                     if *len == 1 {
@@ -1413,7 +1413,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 read_reg("r15"),
                                 read_reg("eflags")
                             );
-                            println!("");
+                            println!();
 
                             println!(
                                 "cr0={}  cr2={}  cr3={}",
@@ -1422,11 +1422,11 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 read_reg("cr3")
                             );
                             println!("cr4={}  cr8={}", read_reg("cr4"), read_reg("cr8"));
-                            println!("");
+                            println!();
 
                             // println!("dr0={}  dr1={}  dr2={}", read_reg("dr0"), read_reg("dr1"), read_reg("dr2"));
                             // println!("dr3={}  dr6={}  dr7={}", read_reg("dr3"), read_reg("dr6"), read_reg("dr7"));
-                            // println!("");
+                            // println!();
 
                             println!(
                                 "cs={}  ds={}  es={}",
@@ -1440,7 +1440,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 read_reg("gs"),
                                 read_reg("ss")
                             );
-                            println!("");
+                            println!();
                         }
                         Ok(ReplCommand::Si) => {
                             if client.is_running {
@@ -1470,11 +1470,11 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                                 .map(|bp| bp.id);
 
                             // temporarily disable breakpoint at current rip if present
-                            if let Some(bp_id) = bp_at_rip {
-                                if let Err(e) = breakpoints.disable(&mut client, bp_id) {
-                                    error!("failed to disable breakpoint for step: {}", e);
-                                    continue;
-                                }
+                            if let Some(bp_id) = bp_at_rip
+                                && let Err(e) = breakpoints.disable(&mut client, bp_id)
+                            {
+                                error!("failed to disable breakpoint for step: {}", e);
+                                continue;
                             }
 
                             if let Err(e) = client.step() {
@@ -1496,10 +1496,10 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             }
 
                             // reenable the breakpoint after stepping
-                            if let Some(bp_id) = bp_at_rip {
-                                if let Err(e) = breakpoints.enable(&mut client, bp_id) {
-                                    error!("failed to re-enable breakpoint after step: {}", e);
-                                }
+                            if let Some(bp_id) = bp_at_rip
+                                && let Err(e) = breakpoints.enable(&mut client, bp_id)
+                            {
+                                error!("failed to re-enable breakpoint after step: {}", e);
                             }
 
                             if let Ok(tid) = client.get_stopped_thread_id() {
@@ -1574,11 +1574,8 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                             {
                                 Ok(id) => {
                                     update_breakpoint_cache!(breakpoints, shared_breakpoints);
-                                    let scope = if target_cr3.is_some() {
-                                        format!(
-                                            " (process-specific, CR3={:#x})",
-                                            target_cr3.unwrap()
-                                        )
+                                    let scope = if let Some(target_cr3) = target_cr3 {
+                                        format!(" (process-specific, CR3={:#x})", target_cr3)
                                     } else {
                                         " (global)".to_string()
                                     };
@@ -1872,7 +1869,7 @@ pub fn start_repl(debugger: &mut DebuggerContext) -> Result<()> {
                         }
                         Ok(ReplCommand::Status) => {
                             if client.is_running {
-                                println!("{}\n", "VM is running");
+                                println!("VM is running\n");
                             } else {
                                 if let Err(e) = client.set_current_thread(&current_thread) {
                                     error!("failed to set thread context: {:?}", e);

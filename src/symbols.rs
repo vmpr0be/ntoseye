@@ -6,18 +6,18 @@ use crate::{
     memory,
     types::{Dtb, PhysAddr, VirtAddr},
 };
+use dashmap::DashMap;
 use fst::{Automaton, IntoStreamer, Set, SetBuilder, Streamer, automaton::Str};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use memmap2::Mmap;
-use pdb::{FallibleIterator, PrimitiveKind, TypeData, TypeFinder, TypeIndex};
+use pdb2::{FallibleIterator, PrimitiveKind, TypeData, TypeFinder, TypeIndex};
 use pelite::{
     image::GUID,
     pe64::{Pe, debug::CodeView},
 };
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use reqwest;
+use spin::Mutex;
 use std::{
-    cell::RefCell,
     collections::HashMap,
     fs::File,
     path::PathBuf,
@@ -34,17 +34,13 @@ pub struct SymbolIndex {
 }
 
 pub struct SymbolStore {
-    // NOTE im not sure RefCell was the best solution here; however,
-    // the PDB type contains many functions which require &mut self,
-    // and that was littering code in other places with mut where there
-    // shouldn't be anything mutated.
-    pdbs: HashMap<u128, RefCell<pdb::PDB<'static, Cursor<&'static [u8]>>>>,
+    pdbs: DashMap<u128, Mutex<pdb2::PDB<'static, Cursor<&'static [u8]>>>>,
 
-    mmaps: HashMap<u128, Arc<Mmap>>,
-    index: HashMap<u128, SymbolIndex>,
-    index_types: HashMap<u128, SymbolIndex>,
+    mmaps: DashMap<u128, Arc<Mmap>>,
+    index: DashMap<u128, SymbolIndex>,
+    index_types: DashMap<u128, SymbolIndex>,
 
-    modules: HashMap<u64, LoadedModule>,
+    modules: DashMap<u64, LoadedModule>,
 }
 
 fn guid_to_u128(guid: GUID) -> u128 {
@@ -259,11 +255,11 @@ pub struct LoadedModule {
 impl SymbolStore {
     pub fn new() -> Self {
         Self {
-            pdbs: HashMap::new(),
-            mmaps: HashMap::new(),
-            index: HashMap::new(),
-            index_types: HashMap::new(),
-            modules: HashMap::new(),
+            pdbs: DashMap::new(),
+            mmaps: DashMap::new(),
+            index: DashMap::new(),
+            index_types: DashMap::new(),
+            modules: DashMap::new(),
         }
     }
 
@@ -271,7 +267,7 @@ impl SymbolStore {
     // TODO (everywhere) propagate errors with format!
     // NOTE dont check for more than 1 CV entry, there shouldn't be more than 1
     pub fn load_from_binary(
-        &mut self,
+        &self,
         kvm: &KvmHandle,
         object: &mut WinObject,
     ) -> Result<Option<u128>> {
@@ -279,72 +275,67 @@ impl SymbolStore {
         let debug = view.debug()?;
 
         for entry in debug.iter().filter_map(|e| e.entry().ok()) {
-            if let Some(cv) = entry.as_code_view() {
-                match cv {
-                    CodeView::Cv70 {
-                        image,
-                        pdb_file_name,
-                    } => {
-                        let guid_str = format!(
-                            "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                            image.Signature.Data1,
-                            image.Signature.Data2,
-                            image.Signature.Data3,
-                            image.Signature.Data4[0],
-                            image.Signature.Data4[1],
-                            image.Signature.Data4[2],
-                            image.Signature.Data4[3],
-                            image.Signature.Data4[4],
-                            image.Signature.Data4[5],
-                            image.Signature.Data4[6],
-                            image.Signature.Data4[7],
-                        );
+            if let Some(CodeView::Cv70 {
+                image,
+                pdb_file_name,
+            }) = entry.as_code_view()
+            {
+                let guid_str = format!(
+                    "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                    image.Signature.Data1,
+                    image.Signature.Data2,
+                    image.Signature.Data3,
+                    image.Signature.Data4[0],
+                    image.Signature.Data4[1],
+                    image.Signature.Data4[2],
+                    image.Signature.Data4[3],
+                    image.Signature.Data4[4],
+                    image.Signature.Data4[5],
+                    image.Signature.Data4[6],
+                    image.Signature.Data4[7],
+                );
 
-                        let url = format!(
-                            "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
-                            pdb_file_name, guid_str, image.Age, pdb_file_name
-                        );
+                let url = format!(
+                    "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
+                    pdb_file_name, guid_str, image.Age, pdb_file_name
+                );
 
-                        let stem = pdb_file_name
-                            .to_str()
-                            .ok()
-                            .and_then(|s| s.split('.').next())
-                            .unwrap_or("");
+                let stem = pdb_file_name
+                    .to_str()
+                    .ok()
+                    .and_then(|s| s.split('.').next())
+                    .unwrap_or("");
 
-                        let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
-                        let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
-                        let path = storage_dir.join(&filename);
+                let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
+                let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
+                let path = storage_dir.join(&filename);
 
-                        let job = DownloadJob {
-                            url,
-                            path: path.clone(),
-                            filename: format!("{}.pdb", stem),
-                        };
-                        download_pdb_single(&job)?;
+                let job = DownloadJob {
+                    url,
+                    path: path.clone(),
+                    filename: format!("{}.pdb", stem),
+                };
+                download_pdb_single(&job)?;
 
-                        let guid = guid_to_u128(image.Signature);
-                        let file = File::open(&path)?;
+                let guid = guid_to_u128(image.Signature);
+                let file = File::open(&path)?;
 
-                        let mmap = unsafe { Mmap::map(&file)? };
-                        let mmap = Arc::new(mmap);
-                        let mmap_slice: &[u8] = &mmap;
+                let mmap = unsafe { Mmap::map(&file)? };
+                let mmap = Arc::new(mmap);
+                let mmap_slice: &[u8] = &mmap;
 
-                        // we know `mmap` will live in `self.mmaps` as long as `self.pdbs` exists
-                        let static_slice: &'static [u8] =
-                            unsafe { std::mem::transmute(mmap_slice) };
-                        let cursor = Cursor::new(static_slice);
+                // we know `mmap` will live in `self.mmaps` as long as `self.pdbs` exists
+                let static_slice: &'static [u8] = unsafe { std::mem::transmute(mmap_slice) };
+                let cursor = Cursor::new(static_slice);
 
-                        let pdb = pdb::PDB::open(cursor)?;
+                let pdb = pdb2::PDB::open(cursor)?;
 
-                        self.mmaps.insert(guid, mmap);
-                        self.pdbs.insert(guid, pdb.into());
+                self.mmaps.insert(guid, mmap);
+                self.pdbs.insert(guid, pdb.into());
 
-                        self.build_index(guid);
+                self.build_index(guid);
 
-                        return Ok(Some(guid_to_u128(image.Signature)));
-                    }
-                    _ => (),
-                }
+                return Ok(Some(guid_to_u128(image.Signature)));
             }
         }
 
@@ -368,53 +359,49 @@ impl SymbolStore {
         let debug = view.debug()?;
 
         for entry in debug.iter().filter_map(|e| e.entry().ok()) {
-            if let Some(cv) = entry.as_code_view() {
-                match cv {
-                    CodeView::Cv70 {
-                        image,
-                        pdb_file_name,
-                    } => {
-                        let guid_str = format!(
-                            "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                            image.Signature.Data1,
-                            image.Signature.Data2,
-                            image.Signature.Data3,
-                            image.Signature.Data4[0],
-                            image.Signature.Data4[1],
-                            image.Signature.Data4[2],
-                            image.Signature.Data4[3],
-                            image.Signature.Data4[4],
-                            image.Signature.Data4[5],
-                            image.Signature.Data4[6],
-                            image.Signature.Data4[7],
-                        );
+            if let Some(CodeView::Cv70 {
+                image,
+                pdb_file_name,
+            }) = entry.as_code_view()
+            {
+                let guid_str = format!(
+                    "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                    image.Signature.Data1,
+                    image.Signature.Data2,
+                    image.Signature.Data3,
+                    image.Signature.Data4[0],
+                    image.Signature.Data4[1],
+                    image.Signature.Data4[2],
+                    image.Signature.Data4[3],
+                    image.Signature.Data4[4],
+                    image.Signature.Data4[5],
+                    image.Signature.Data4[6],
+                    image.Signature.Data4[7],
+                );
 
-                        let url = format!(
-                            "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
-                            pdb_file_name, guid_str, image.Age, pdb_file_name
-                        );
+                let url = format!(
+                    "https://msdl.microsoft.com/download/symbols/{}/{}{:X}/{}",
+                    pdb_file_name, guid_str, image.Age, pdb_file_name
+                );
 
-                        let stem = pdb_file_name
-                            .to_str()
-                            .ok()
-                            .and_then(|s| s.split('.').next())
-                            .unwrap_or("");
+                let stem = pdb_file_name
+                    .to_str()
+                    .ok()
+                    .and_then(|s| s.split('.').next())
+                    .unwrap_or("");
 
-                        let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
-                        let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
-                        let path = storage_dir.join(&filename);
+                let filename = format!("{}.{}{:X}.pdb", stem, guid_str, image.Age);
+                let storage_dir = get_storage_directory().ok_or(Error::StorageNotFound)?;
+                let path = storage_dir.join(&filename);
 
-                        let guid = guid_to_u128(image.Signature);
-                        let job = DownloadJob {
-                            url,
-                            path,
-                            filename: format!("{}.pdb", stem),
-                        };
+                let guid = guid_to_u128(image.Signature);
+                let job = DownloadJob {
+                    url,
+                    path,
+                    filename: format!("{}.pdb", stem),
+                };
 
-                        return Ok(Some((job, guid)));
-                    }
-                    _ => (),
-                }
+                return Ok(Some((job, guid)));
             }
         }
 
@@ -422,7 +409,7 @@ impl SymbolStore {
     }
 
     pub fn load_downloaded_pdb(
-        &mut self,
+        &self,
         job: &DownloadJob,
         guid: u128,
         name: &str,
@@ -447,10 +434,11 @@ impl SymbolStore {
             let static_slice: &'static [u8] = unsafe { std::mem::transmute(mmap_slice) };
             let cursor = Cursor::new(static_slice);
 
-            let pdb = pdb::PDB::open(cursor)?;
+            let pdb = pdb2::PDB::open(cursor)?;
 
             self.mmaps.insert(guid, mmap);
             self.pdbs.insert(guid, pdb.into());
+
             self.build_index(guid);
         }
 
@@ -470,11 +458,11 @@ impl SymbolStore {
     pub fn merged_symbol_index(&self, dtb: Option<Dtb>) -> SymbolIndex {
         let mut all_strings: Vec<String> = Vec::new();
 
-        for module in self.modules.values() {
-            if let Some(filter_dtb) = dtb {
-                if module.dtb != filter_dtb {
-                    continue;
-                }
+        for module in self.modules.iter() {
+            if let Some(filter_dtb) = dtb
+                && module.dtb != filter_dtb
+            {
+                continue;
             }
 
             if let Some(index) = self.index.get(&module.guid) {
@@ -504,11 +492,11 @@ impl SymbolStore {
     pub fn merged_types_index(&self, dtb: Option<Dtb>) -> SymbolIndex {
         let mut all_strings: Vec<String> = Vec::new();
 
-        for module in self.modules.values() {
-            if let Some(filter_dtb) = dtb {
-                if module.dtb != filter_dtb {
-                    continue;
-                }
+        for module in self.modules.iter() {
+            if let Some(filter_dtb) = dtb
+                && module.dtb != filter_dtb
+            {
+                continue;
             }
 
             if let Some(index) = self.index_types.get(&module.guid) {
@@ -536,7 +524,7 @@ impl SymbolStore {
     }
 
     pub fn find_type_across_modules(&self, dtb: Dtb, type_name: &str) -> Option<TypeInfo> {
-        for module in self.modules.values() {
+        for module in self.modules.iter() {
             if module.dtb != dtb {
                 continue;
             }
@@ -548,7 +536,7 @@ impl SymbolStore {
     }
 
     pub fn find_symbol_across_modules(&self, dtb: Dtb, symbol_name: &str) -> Option<VirtAddr> {
-        for module in self.modules.values() {
+        for module in self.modules.iter() {
             if module.dtb != dtb {
                 continue;
             }
@@ -566,38 +554,35 @@ impl SymbolStore {
     ) -> Option<(String, String, u32)> {
         use crate::guest::ModuleInfo;
 
-        for module in self.modules.values() {
+        for module in self.modules.iter() {
             if module.dtb != dtb {
                 continue;
             }
 
             let module_end = module.base_address.0.saturating_add(module.size as u64);
-            if address.0 >= module.base_address.0 && address.0 < module_end {
-                if let Some((sym_name, offset)) =
+            if address.0 >= module.base_address.0
+                && address.0 < module_end
+                && let Some((sym_name, offset)) =
                     self.get_address_of_closest_symbol(module.guid, module.base_address, address)
-                {
-                    let short_name = ModuleInfo::derive_short_name(&module.name);
-                    return Some((short_name, sym_name, offset));
-                }
+            {
+                let short_name = ModuleInfo::derive_short_name(&module.name);
+                return Some((short_name, sym_name, offset));
             }
         }
         None
     }
 
-    fn build_index(&mut self, guid: u128) -> Option<()> {
+    fn build_index(&self, guid: u128) -> Option<()> {
         let pdb = self.pdbs.get_mut(&guid)?;
-        let mut pdb = pdb.borrow_mut();
-        let symbol_table = pdb.global_symbols().ok()?;
+        let mut pdb_lock = pdb.lock();
+        let symbol_table = pdb_lock.global_symbols().ok()?;
         let mut symbols = symbol_table.iter();
 
         let mut strings: Vec<String> = Vec::new();
 
         while let Some(symbol) = symbols.next().ok()? {
-            match symbol.parse() {
-                Ok(pdb::SymbolData::Public(data)) => {
-                    strings.push(data.name.to_string().into());
-                }
-                _ => {}
+            if let Ok(pdb2::SymbolData::Public(data)) = symbol.parse() {
+                strings.push(data.name.to_string().into());
             }
         }
 
@@ -617,19 +602,18 @@ impl SymbolStore {
         // NOW FOR TYPES!
         let mut strings: Vec<String> = Vec::new();
 
-        let type_information = pdb.type_information().ok()?;
+        let type_information = pdb_lock.type_information().ok()?;
         let mut type_finder = type_information.finder();
         let mut iter = type_information.iter();
 
         while let Some(typ) = iter.next().ok()? {
             type_finder.update(&iter);
 
-            if let Ok(TypeData::Class(class)) = typ.parse() {
-                if !class.properties.forward_reference()
-                    && class.name.to_string() != "<anonymous-tag>"
-                {
-                    strings.push(class.name.to_string().into());
-                }
+            if let Ok(TypeData::Class(class)) = typ.parse()
+                && !class.properties.forward_reference()
+                && class.name.to_string() != "<anonymous-tag>"
+            {
+                strings.push(class.name.to_string().into());
             }
         }
 
@@ -663,20 +647,20 @@ impl SymbolStore {
     {
         let symbol_name = symbol_name.as_ref();
 
-        let pdb = self.pdbs.get(&guid)?;
-        let mut pdb = pdb.borrow_mut();
-        let symbol_table = pdb.global_symbols().ok()?;
-        let address_map = pdb.address_map().ok()?;
+        let pdb = self.pdbs.get_mut(&guid)?;
+        let mut pdb_lock = pdb.lock();
+        let symbol_table = pdb_lock.global_symbols().ok()?;
+        let address_map = pdb_lock.address_map().ok()?;
         let mut symbols = symbol_table.iter();
 
         while let Some(symbol) = symbols.next().ok()? {
             match symbol.parse() {
-                Ok(pdb::SymbolData::Public(data)) => {
+                Ok(pdb2::SymbolData::Public(data)) => {
                     if data.name.to_string() == symbol_name {
                         return Some(data.offset.to_rva(&address_map).unwrap_or_default().0);
                     }
                 }
-                Ok(pdb::SymbolData::Data(_data)) => {
+                Ok(pdb2::SymbolData::Data(_data)) => {
                     // TODO does this need to also be checked?
                 }
                 _ => {}
@@ -692,35 +676,32 @@ impl SymbolStore {
         base_address: VirtAddr,
         address: VirtAddr,
     ) -> Option<(String, u32)> {
-        let pdb = self.pdbs.get(&guid)?;
-        let mut pdb = pdb.borrow_mut();
-        let symbol_table = pdb.global_symbols().ok()?;
-        let address_map = pdb.address_map().ok()?;
+        let pdb = self.pdbs.get_mut(&guid)?;
+        let mut pdb_lock = pdb.lock();
+        let symbol_table = pdb_lock.global_symbols().ok()?;
+        let address_map = pdb_lock.address_map().ok()?;
         let mut symbols = symbol_table.iter();
 
         let mut closest: Option<(String, u32)> = None;
         let max_offset = 8192u32;
 
         while let Some(symbol) = symbols.next().ok()? {
-            match symbol.parse() {
-                Ok(pdb::SymbolData::Public(data)) => {
-                    if let Some(rva) = data.offset.to_rva(&address_map) {
-                        let symbol_address = base_address + rva.0.into();
-                        if address.0 >= symbol_address.0 {
-                            let offset = (address.0 - symbol_address.0) as u32;
-                            if offset <= max_offset {
-                                if let Some((_, best_offset)) = closest {
-                                    if offset < best_offset {
-                                        closest = Some((data.name.to_string().into(), offset));
-                                    }
-                                } else {
-                                    closest = Some((data.name.to_string().into(), offset));
-                                }
+            if let Ok(pdb2::SymbolData::Public(data)) = symbol.parse()
+                && let Some(rva) = data.offset.to_rva(&address_map)
+            {
+                let symbol_address = base_address + rva.0 as u64;
+                if address.0 >= symbol_address.0 {
+                    let offset = (address.0 - symbol_address.0) as u32;
+                    if offset <= max_offset {
+                        if let Some((_, best_offset)) = closest {
+                            if offset < best_offset {
+                                closest = Some((data.name.to_string().into(), offset));
                             }
+                        } else {
+                            closest = Some((data.name.to_string().into(), offset));
                         }
                     }
                 }
-                _ => {}
             }
         }
 
@@ -729,63 +710,63 @@ impl SymbolStore {
 
     fn get_type_size<'p>(
         &self,
-        finder: &pdb::TypeFinder<'p>,
-        index: pdb::TypeIndex,
+        finder: &pdb2::TypeFinder<'p>,
+        index: pdb2::TypeIndex,
         ptr_size: u64,
-    ) -> pdb::Result<u64> {
+    ) -> pdb2::Result<u64> {
         let item = finder.find(index)?;
         match item.parse()? {
-            pdb::TypeData::Primitive(data) => match data.kind {
-                pdb::PrimitiveKind::Void => Ok(0),
+            pdb2::TypeData::Primitive(data) => match data.kind {
+                pdb2::PrimitiveKind::Void => Ok(0),
 
-                pdb::PrimitiveKind::Char
-                | pdb::PrimitiveKind::RChar
-                | pdb::PrimitiveKind::UChar
-                | pdb::PrimitiveKind::I8
-                | pdb::PrimitiveKind::U8
-                | pdb::PrimitiveKind::Bool8 => Ok(1),
+                pdb2::PrimitiveKind::Char
+                | pdb2::PrimitiveKind::RChar
+                | pdb2::PrimitiveKind::UChar
+                | pdb2::PrimitiveKind::I8
+                | pdb2::PrimitiveKind::U8
+                | pdb2::PrimitiveKind::Bool8 => Ok(1),
 
-                pdb::PrimitiveKind::WChar
-                | pdb::PrimitiveKind::RChar16
-                | pdb::PrimitiveKind::Short
-                | pdb::PrimitiveKind::UShort
-                | pdb::PrimitiveKind::I16
-                | pdb::PrimitiveKind::U16 => Ok(2),
+                pdb2::PrimitiveKind::WChar
+                | pdb2::PrimitiveKind::RChar16
+                | pdb2::PrimitiveKind::Short
+                | pdb2::PrimitiveKind::UShort
+                | pdb2::PrimitiveKind::I16
+                | pdb2::PrimitiveKind::U16 => Ok(2),
 
-                pdb::PrimitiveKind::Long
-                | pdb::PrimitiveKind::ULong
-                | pdb::PrimitiveKind::I32
-                | pdb::PrimitiveKind::U32
-                | pdb::PrimitiveKind::Bool32
-                | pdb::PrimitiveKind::F32
-                | pdb::PrimitiveKind::RChar32 => Ok(4),
+                pdb2::PrimitiveKind::Long
+                | pdb2::PrimitiveKind::ULong
+                | pdb2::PrimitiveKind::I32
+                | pdb2::PrimitiveKind::U32
+                | pdb2::PrimitiveKind::Bool32
+                | pdb2::PrimitiveKind::F32
+                | pdb2::PrimitiveKind::RChar32 => Ok(4),
 
-                pdb::PrimitiveKind::Quad
-                | pdb::PrimitiveKind::UQuad
-                | pdb::PrimitiveKind::I64
-                | pdb::PrimitiveKind::U64
-                | pdb::PrimitiveKind::F64 => Ok(8),
+                pdb2::PrimitiveKind::Quad
+                | pdb2::PrimitiveKind::UQuad
+                | pdb2::PrimitiveKind::I64
+                | pdb2::PrimitiveKind::U64
+                | pdb2::PrimitiveKind::F64 => Ok(8),
 
-                pdb::PrimitiveKind::Octa | pdb::PrimitiveKind::UOcta => Ok(16),
+                pdb2::PrimitiveKind::Octa | pdb2::PrimitiveKind::UOcta => Ok(16),
 
                 _ => Ok(0),
             },
-            pdb::TypeData::Class(data) => Ok(data.size as u64), // NOTE this might (probably will) return 0
-            pdb::TypeData::Union(data) => Ok(data.size as u64), // FIXME possibly? ^^
-            pdb::TypeData::Pointer(_) => Ok(ptr_size),
-            pdb::TypeData::Modifier(data) => {
+            pdb2::TypeData::Class(data) => Ok(data.size), // NOTE this might (probably will) return 0
+            pdb2::TypeData::Union(data) => Ok(data.size), // FIXME possibly? ^^
+            pdb2::TypeData::Pointer(_) => Ok(ptr_size),
+            pdb2::TypeData::Modifier(data) => {
                 self.get_type_size(finder, data.underlying_type, ptr_size)
             }
-            pdb::TypeData::Enumeration(data) => {
+            pdb2::TypeData::Enumeration(data) => {
                 self.get_type_size(finder, data.underlying_type, ptr_size)
             }
-            pdb::TypeData::Array(data) => {
+            pdb2::TypeData::Array(data) => {
                 Ok(data.dimensions.iter().fold(0, |acc, &x| acc + x as u64))
             }
-            pdb::TypeData::Bitfield(data) => {
+            pdb2::TypeData::Bitfield(data) => {
                 self.get_type_size(finder, data.underlying_type, ptr_size)
             }
-            pdb::TypeData::Procedure(_) => Ok(ptr_size),
+            pdb2::TypeData::Procedure(_) => Ok(ptr_size),
             _ => Ok(0),
         }
     }
@@ -794,12 +775,12 @@ impl SymbolStore {
         &self,
         finder: &TypeFinder<'p>,
         index: TypeIndex,
-    ) -> pdb::Result<ParsedType> {
+    ) -> pdb2::Result<ParsedType> {
         let item = finder.find(index)?;
         let parsed = item.parse()?;
 
         match parsed {
-            pdb::TypeData::Primitive(data) => {
+            pdb2::TypeData::Primitive(data) => {
                 let name = match data.kind {
                     PrimitiveKind::Void => "void",
                     PrimitiveKind::Char | PrimitiveKind::I8 => "CHAR",
@@ -837,7 +818,7 @@ impl SymbolStore {
 
             TypeData::Array(data) => {
                 let inner = self.resolve_type(finder, data.element_type)?;
-                let count = data.dimensions.get(0).unwrap_or(&0).clone();
+                let count = data.dimensions.first().unwrap_or(&0);
                 let mut sizeof_type = self.get_type_size(finder, data.element_type, 8)? as u32;
                 if sizeof_type == 0 {
                     sizeof_type = 1;
@@ -857,21 +838,20 @@ impl SymbolStore {
                 })
             }
 
-            pdb::TypeData::Procedure(data) => {
+            pdb2::TypeData::Procedure(data) => {
                 let return_type = if let Some(idx) = data.return_type {
-                    let t = self.resolve_type(finder, idx)?;
-                    t
+                    self.resolve_type(finder, idx)?
                 } else {
                     ParsedType::Primitive("void".to_string())
                 };
 
                 let mut args = Vec::new();
-                if let Ok(arg_item) = finder.find(data.argument_list) {
-                    if let Ok(pdb::TypeData::ArgumentList(list)) = arg_item.parse() {
-                        for arg_idx in list.arguments {
-                            let arg_type = self.resolve_type(finder, arg_idx)?;
-                            args.push(arg_type);
-                        }
+                if let Ok(arg_item) = finder.find(data.argument_list)
+                    && let Ok(pdb2::TypeData::ArgumentList(list)) = arg_item.parse()
+                {
+                    for arg_idx in list.arguments {
+                        let arg_type = self.resolve_type(finder, arg_idx)?;
+                        args.push(arg_type);
                     }
                 }
 
@@ -884,10 +864,10 @@ impl SymbolStore {
 
     fn process_field_list<'p>(
         &self,
-        type_finder: &pdb::TypeFinder<'p>,
-        field_index: pdb::TypeIndex,
+        type_finder: &pdb2::TypeFinder<'p>,
+        field_index: pdb2::TypeIndex,
         fields_map: &mut HashMap<String, FieldInfo>,
-    ) -> pdb::Result<()> {
+    ) -> pdb2::Result<()> {
         let field_item = type_finder.find(field_index)?;
 
         if let Ok(TypeData::FieldList(list)) = field_item.parse() {
@@ -920,32 +900,30 @@ impl SymbolStore {
     where
         S: Into<String> + AsRef<str>,
     {
-        let pdb = self.pdbs.get(&guid)?;
-        let mut pdb = pdb.borrow_mut();
-
-        let type_information = pdb.type_information().ok()?;
+        let pdb = self.pdbs.get_mut(&guid)?;
+        let mut pdb_lock = pdb.lock();
+        let type_information = pdb_lock.type_information().ok()?;
         let mut type_finder = type_information.finder();
         let mut iter = type_information.iter();
 
         while let Some(typ) = iter.next().ok()? {
             type_finder.update(&iter);
 
-            if let Ok(TypeData::Class(class)) = typ.parse() {
-                if class.name.to_string() == struct_name.as_ref()
-                    && !class.properties.forward_reference()
-                {
-                    let mut fields_map: HashMap<String, FieldInfo> = HashMap::new();
-                    if let Some(field_index) = class.fields {
-                        self.process_field_list(&type_finder, field_index, &mut fields_map)
-                            .ok()?;
-                    }
-
-                    return Some(TypeInfo {
-                        name: struct_name.into(),
-                        size: class.size as usize,
-                        fields: fields_map,
-                    });
+            if let Ok(TypeData::Class(class)) = typ.parse()
+                && class.name.to_string() == struct_name.as_ref()
+                && !class.properties.forward_reference()
+            {
+                let mut fields_map: HashMap<String, FieldInfo> = HashMap::new();
+                if let Some(field_index) = class.fields {
+                    self.process_field_list(&type_finder, field_index, &mut fields_map)
+                        .ok()?;
                 }
+
+                return Some(TypeInfo {
+                    name: struct_name.into(),
+                    size: class.size as usize,
+                    fields: fields_map,
+                });
             }
         }
 

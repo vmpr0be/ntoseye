@@ -1,14 +1,17 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::{
     backend::MemoryOps,
     error::{Error, Result},
     host::KvmHandle,
-    memory::{self},
+    memory::{self, AddressSpace, PAGE_SIZE},
     symbols::{SymbolStore, TypeInfo},
     types::*,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use pelite::pe64::{Pe, PeView};
-use zerocopy::{FromBytes, IntoBytes};
+use rayon::prelude::*;
+use zerocopy::IntoBytes;
 
 /// used for enumeration without loading full WinObject
 #[derive(Debug, Clone)]
@@ -172,7 +175,7 @@ impl WinObject {
 
     // TODO binary should probably be reread to ensure correctness
     // TODO bc shared memory might/isnt used, this needs to be mutable to ensure data is fresh :/
-    pub fn view<'a, B: MemoryOps<PhysAddr>>(&mut self, backend: &'a B) -> Option<PeView<'_>> {
+    pub fn view<B: MemoryOps<PhysAddr>>(&mut self, backend: &B) -> Option<PeView<'_>> {
         if self.binary_snapshot.is_empty() {
             let memory = self.memory(backend);
             self.binary_snapshot = read_pe_image(self.base_address, &memory).ok()?;
@@ -197,307 +200,171 @@ pub struct Guest {
     pub ntoskrnl: WinObject,
 }
 
-fn verify_pml4(page: &[u8; 0x1000], pa: u64) -> bool {
-    let ptes: &[PageTableEntry] = FromBytes::ref_from_bytes(page).unwrap();
+fn is_valid_kernel_dtb(kvm: &KvmHandle, dtb: Dtb) -> Result<bool> {
+    let kernel_pml4 = kvm.read::<[PageTableEntry; 256]>(dtb + 8 * 256)?;
 
-    // usermode PTEs
-    let user_zero = ptes.iter().take(256).filter(|&&x| x.is_zero()).count();
-
-    // kernelmode PTEs
-    let (mut kernel_zero, mut kernel_valid, mut self_ref) = (0, 0, false);
-    for &pte in &ptes[256..512] {
-        if pte.is_zero() {
-            kernel_zero += 1;
-            continue;
-        }
-
-        // supervisor entry
-        if pte.is_kernel_table() {
-            let pdpt_pa = pte.pte_frame_addr();
-            if pdpt_pa < 0x10000000000 {
-                kernel_valid += 1;
-            }
-        }
-
-        self_ref |= pte.is_self_ref(pa);
+    if kernel_pml4
+        .into_iter()
+        .filter(|e| e.page_frame() == dtb)
+        .count()
+        != 1
+    {
+        return Ok(false);
     }
 
-    self_ref && kernel_valid >= 6 && user_zero > 0x40 && kernel_zero > 0x40
-}
+    // Check if use KUSER_SHARED_DATA is mapped
+    const KUSER_SHARED_DATA_VA: VirtAddr = VirtAddr::from_u64(0xfffff78000000000);
 
-const PML_REGION_SIZE: [u64; 5] = [0, 12, 21, 30, 39];
+    let addr_space = AddressSpace::new(kvm, dtb);
 
-// TODO i dont think u64 should be used here
-fn scan_large_pages(
-    kvm: &KvmHandle,
-    pa_table: u64,
-    va_base: u64,
-    va_min: u64,
-    va_max: u64,
-    level: usize,
-    out_va_base: &mut u64,
-    out_size: &mut u64,
-) -> bool {
-    if level < 2 {
-        return false;
-    }
-
-    let page: [u8; 0x1000] = match kvm.read(pa_table) {
-        Ok(page) => page,
-        Err(_) => return false,
-    };
-
-    if level == 4 {
-        if !verify_pml4(&page, pa_table) {
-            return false;
-        }
-    }
-
-    let ptes: &[PageTableEntry] = FromBytes::ref_from_bytes(&page).unwrap();
-
-    for (i, pte) in ptes.iter().enumerate() {
-        let va_current = memory::sign_extend_48bit((i << PML_REGION_SIZE[level]) as u64 + va_base);
-
-        if *out_va_base != 0 && (va_current > (*out_va_base + *out_size)) {
-            return *out_size > 0;
-        }
-
-        if va_current < va_min {
-            continue;
-        }
-
-        if va_current > va_max {
-            return *out_size > 0;
-        }
-
-        if !pte.is_present() {
-            continue;
-        }
-
-        if level == 2 {
-            if !pte.is_large_page() {
-                continue;
-            }
-
-            if *out_va_base == 0 {
-                *out_va_base = va_current;
-            }
-
-            *out_size += 0x200000; // 2 MiB
-        }
-
-        if pte.is_large_page() {
-            continue;
-        }
-
-        let next_table = pte.pte_frame_addr();
-        if scan_large_pages(
-            kvm,
-            next_table,
-            va_current,
-            va_min,
-            va_max,
-            level - 1,
-            out_va_base,
-            out_size,
-        ) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn scan_small_pages(
-    kvm: &KvmHandle,
-    pa_table: u64,
-    va_base: u64,
-    va_min: u64,
-    va_max: u64,
-    level: usize,
-    candidates: &mut std::collections::BTreeSet<u64>,
-) {
-    if level == 0 {
-        return;
-    }
-
-    let page: [u8; 0x1000] = match kvm.read(pa_table) {
-        Ok(page) => page,
-        Err(_) => return,
-    };
-
-    let va_base = if level == 4 {
-        if !verify_pml4(&page, pa_table) {
-            return;
-        }
-        0
+    if let Some(xlat) = addr_space.virt_to_phys(KUSER_SHARED_DATA_VA)?
+        && !xlat.user
+        && xlat.nx {
+        Ok(true)
     } else {
-        va_base
-    };
-
-    let ptes: &[PageTableEntry] = FromBytes::ref_from_bytes(&page).unwrap();
-
-    for i in 0..512 {
-        let va_current =
-            memory::sign_extend_48bit(va_base + ((i as u64) << PML_REGION_SIZE[level]));
-
-        if va_current < va_min {
-            continue;
-        }
-        if va_current > va_max {
-            return;
-        }
-
-        let pte = ptes[i];
-        if !pte.is_present() {
-            continue;
-        }
-
-        if level == 1 {
-            // Look for the ntoskrnl small page pattern:
-            // page i-1 is empty
-            // page i is ACTIVE-WRITE-SUPERVISOR-NOEXECUTE 0x8000000000000003
-            // pages i+1 to i+31 are ACTIVE-SUPERVISOR 0x01
-
-            if i == 0 {
-                continue;
-            }
-            if !ptes[i - 1].is_zero() {
-                continue;
-            }
-            if (pte.0 & 0x800000000000000f) != 0x8000000000000003 {
-                continue;
-            }
-
-            let mut valid = true;
-            for j in (i + 2)..std::cmp::min(i + 32, 512) {
-                if (ptes[j].0 & 0x0f) != 0x01 {
-                    valid = false;
-                    break;
-                }
-            }
-
-            if valid {
-                candidates.insert(va_current);
-            }
-            continue;
-        }
-
-        if pte.is_large_page() {
-            continue;
-        }
-
-        let next_table = pte.pte_frame_addr();
-        scan_small_pages(
-            kvm,
-            next_table,
-            va_current,
-            va_min,
-            va_max,
-            level - 1,
-            candidates,
-        );
+        Ok(false)
     }
 }
 
-fn get_ntoskrnl_winobj(kvm: &KvmHandle) -> Result<WinObject> {
-    const KERNEL_VA_MIN: u64 = 0xfffff80000000000;
-    const KERNEL_VA_MAX: u64 = 0xfffff807ffffffff;
+fn find_kernel_dtb(kvm: &KvmHandle) -> Result<Option<Dtb>> {
+    for dtb in (0x1000..0x1000000).step_by(PAGE_SIZE) {
+        if is_valid_kernel_dtb(kvm, dtb)? {
+            return Ok(Some(dtb));
+        }
+    }
 
-    for pa_dtb in (0x1000u64..0x1000000).step_by(0x1000) {
-        let page: [u8; 0x1000] = match kvm.read(pa_dtb) {
-            Ok(page) => page,
-            Err(_) => continue,
+    Ok(None)
+}
+
+fn is_ntoskrnl_pte(kvm: &KvmHandle, pte: PageTableEntry) -> Result<bool> {
+    if pte.is_user() || !pte.is_nx() {
+        return Ok(false);
+    }
+
+    let header = kvm.read::<[u8; 0x1000]>(pte.page_frame())?;
+
+    if header[..4] != [0x4d, 0x5a, 0x90, 0x00] {
+        return Ok(false);
+    }
+
+    for chunk in header.chunks_exact(8) {
+        if chunk != b"POOLCODE" {
+            continue;
+        }
+
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn find_ntoskrnl_va(kernel_dtb: Dtb, kvm: &KvmHandle) -> Result<Option<VirtAddr>> {
+    const KERNEL_VA_MIN: VirtAddr = VirtAddr::from_u64(0xfffff80000000000);
+    const KERNEL_VA_MAX: VirtAddr = VirtAddr::from_u64(0xfffff80800000000);
+
+    let pml4e_count = KERNEL_VA_MAX.pml4_index() - KERNEL_VA_MIN.pml4_index() + 1;
+
+    let kernel_pml4 = kvm.read::<[PageTableEntry; 256]>(kernel_dtb + 8 * 256)?;
+    for (rel_pml4_index, pml4e) in kernel_pml4
+        .into_iter()
+        .enumerate()
+        .skip(KERNEL_VA_MIN.pml4_index() - 256)
+        .take(pml4e_count)
+    {
+        let pml4_index = 256 + rel_pml4_index;
+
+        if !pml4e.is_present() {
+            continue;
+        }
+        let pdpt = kvm.read::<[PageTableEntry; 512]>(pml4e.page_frame())?;
+
+        let pdpte_count = if pml4_index == pml4e_count - 1 {
+            KERNEL_VA_MAX.pdpt_index() + 1
+        } else {
+            512
         };
 
-        if !verify_pml4(&page, pa_dtb) {
-            continue;
-        }
+        for (pdpt_index, pdpte) in pdpt.into_iter().take(pdpte_count).enumerate() {
+            if !pdpte.is_present() {
+                continue;
+            }
 
-        let mut kernel_base = 0u64;
-        let mut kernel_size = 0u64;
+            if pdpte.is_large_page() {
+                // Unlikely but just making sure
+                if is_ntoskrnl_pte(kvm, pdpte)? {
+                    return Ok(Some(VirtAddr::construct(pml4_index, pdpt_index, 0, 0)));
+                }
 
-        let kernel_space = memory::AddressSpace::new(kvm, pa_dtb);
+                continue;
+            }
 
-        if scan_large_pages(
-            &kvm,
-            pa_dtb,
-            0,
-            KERNEL_VA_MIN,
-            KERNEL_VA_MAX,
-            4,
-            &mut kernel_base,
-            &mut kernel_size,
-        ) {
-            if kernel_size >= 0x400000 && kernel_size < 0x1800000 {
-                let mut kernel = vec![0u8; kernel_size as usize];
+            let pd = kvm.read::<[PageTableEntry; 512]>(pdpte.page_frame())?;
 
-                if let Err(_) = kernel_space.read_bytes(VirtAddr(kernel_base), &mut kernel) {
+            let pde_count = if pdpt_index == pdpte_count - 1 {
+                KERNEL_VA_MAX.pd_index() + 1
+            } else {
+                512
+            };
+
+            for (pd_index, pde) in pd.into_iter().take(pde_count).enumerate() {
+                if !pde.is_present() {
                     continue;
                 }
 
-                for p in (0usize..kernel_size as usize).step_by(0x1000) {
-                    let header = u16::read_from_bytes(&kernel[p..p + 2]).unwrap();
-                    if header != 0x5a4d {
-                        // MZ
+                if pde.is_large_page() {
+                    if is_ntoskrnl_pte(kvm, pde)? {
+                        return Ok(Some(VirtAddr::construct(
+                            pml4_index, pdpt_index, pd_index, 0,
+                        )));
+                    }
+
+                    continue;
+                }
+
+                let pt = kvm.read::<[PageTableEntry; 512]>(pde.page_frame())?;
+
+                let pte_count = if pd_index == pde_count - 1 {
+                    KERNEL_VA_MAX.pt_index() + 1
+                } else {
+                    512
+                };
+
+                for (pt_index, pte) in pt.into_iter().take(pte_count).enumerate() {
+                    if !pte.is_present() || !is_ntoskrnl_pte(kvm, pte)? {
                         continue;
                     }
 
-                    for o in (0usize..0x1000).step_by(8) {
-                        let poolcode = u64::read_from_bytes(&kernel[(p + o)..(p + o + 8)]).unwrap();
-                        if poolcode == 0x45444F434C4F4F50u64 {
-                            return Ok(WinObject::new(pa_dtb, VirtAddr(kernel_base + p as u64)));
-                        }
-                    }
+                    return Ok(Some(VirtAddr::construct(
+                        pml4_index, pdpt_index, pd_index, pt_index,
+                    )));
                 }
             }
         }
-
-        let mut candidates = std::collections::BTreeSet::new();
-        scan_small_pages(
-            kvm,
-            pa_dtb,
-            0,
-            KERNEL_VA_MIN,
-            KERNEL_VA_MAX,
-            4,
-            &mut candidates,
-        );
-
-        for va in candidates {
-            let mut page_buf = [0u8; 0x1000];
-            if kernel_space
-                .read_bytes(VirtAddr(va), &mut page_buf)
-                .is_err()
-            {
-                continue;
-            }
-
-            // MZ
-            let header = u16::read_from_bytes(&page_buf[0..2]).unwrap();
-            if header != 0x5a4d {
-                continue;
-            }
-
-            // POOLCODE signature
-            for o in (0usize..0x1000).step_by(8) {
-                let poolcode = u64::read_from_bytes(&page_buf[o..o + 8]).unwrap();
-                if poolcode == 0x45444F434C4F4F50u64 {
-                    return Ok(WinObject::new(pa_dtb, VirtAddr(va)));
-                }
-            }
-        }
-
-        break;
     }
 
-    Err(Error::NtoskrnlNotFound)
+    Ok(None)
+}
+
+fn find_ntoskrnl(kvm: &KvmHandle) -> Result<Option<WinObject>> {
+    let Some(kernel_dtb) = find_kernel_dtb(kvm)? else {
+        return Ok(None);
+    };
+
+    let Some(ntoskrnl_va) = find_ntoskrnl_va(kernel_dtb, kvm)? else {
+        return Ok(None);
+    };
+
+    let ntoskrnl = WinObject::new(kernel_dtb, ntoskrnl_va);
+    Ok(Some(ntoskrnl))
 }
 
 impl Guest {
     // TODO (everywhere) use MemoryOps, not KvmHandle...
     pub fn new(kvm: &KvmHandle, symbols: &mut SymbolStore) -> Result<Self> {
-        let ntoskrnl = get_ntoskrnl_winobj(kvm)?.load_symbols(kvm, symbols)?;
+        let ntoskrnl = find_ntoskrnl(kvm)?
+            .ok_or(Error::NtoskrnlNotFound)?
+            .load_symbols(kvm, symbols)?;
+
         Ok(Self { ntoskrnl })
     }
 
@@ -549,8 +416,8 @@ impl Guest {
             }
             visited.insert(current_eprocess.0);
 
-            let pid: u64 = memory.read(current_eprocess + unique_process_id_offset)?;
-            let dtb: u64 = memory.read(current_eprocess + dir_table_base_offset)?;
+            let pid = memory.read::<u64>(current_eprocess + unique_process_id_offset)?;
+            let dtb = memory.read::<Dtb>(current_eprocess + dir_table_base_offset)? & !0xfff;
 
             if dtb == 0 {
                 break;
@@ -590,7 +457,7 @@ impl Guest {
                 eprocess_va: current_eprocess,
             });
 
-            let flink: VirtAddr = memory.read(current_eprocess + active_process_links_offset)?;
+            let flink = memory.read::<VirtAddr>(current_eprocess + active_process_links_offset)?;
             if flink.0 == 0 {
                 break;
             }
@@ -652,7 +519,7 @@ impl Guest {
                 // Read UNICODE_STRING for BaseDllName
                 let name_length: u16 = process_memory.read(entry_base + base_dll_name_offset)?;
                 let name_buffer: VirtAddr =
-                    process_memory.read(entry_base + base_dll_name_offset + 8)?;
+                    process_memory.read(entry_base + base_dll_name_offset + 8u32)?;
 
                 if name_length > 0 && name_buffer.0 != 0 && name_length < 520 {
                     let mut name_buf = vec![0u8; name_length as usize];
@@ -762,7 +629,7 @@ impl Guest {
             // Read UNICODE_STRING for BaseDllName
             let name_length: u16 = process_memory.read(entry_base + base_dll_name_offset)?;
             let name_buffer: VirtAddr =
-                process_memory.read(entry_base + base_dll_name_offset + 8)?;
+                process_memory.read(entry_base + base_dll_name_offset + 8u32)?;
 
             let name = if name_length > 0 && name_buffer.0 != 0 {
                 let mut name_buf = vec![0u8; name_length as usize];
@@ -840,7 +707,7 @@ impl Guest {
 
             // Read UNICODE_STRING for BaseDllName
             let name_length: u16 = memory.read(entry_base + base_dll_name_offset)?;
-            let name_buffer: VirtAddr = memory.read(entry_base + base_dll_name_offset + 8)?;
+            let name_buffer: VirtAddr = memory.read(entry_base + base_dll_name_offset + 8u32)?;
 
             let name = if name_length > 0 && name_buffer.0 != 0 {
                 let mut name_buf = vec![0u8; name_length as usize];
@@ -888,7 +755,7 @@ impl Guest {
 
         let mut jobs_with_info: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
         let mut already_loaded: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
-        let mut loaded = 0;
+        let loaded = AtomicUsize::new(0);
 
         for module in &modules {
             if Self::is_session_space(module.base_address) {
@@ -918,8 +785,12 @@ impl Guest {
                     .progress_chars("#-"),
             );
 
-            for (job, guid, module) in already_loaded.into_iter().chain(jobs_with_info.into_iter())
-            {
+            let all_jobs = already_loaded
+                .into_iter()
+                .chain(jobs_with_info.into_iter())
+                .collect::<Vec<_>>();
+
+            all_jobs.into_par_iter().for_each(|(job, guid, module)| {
                 if symbols
                     .load_downloaded_pdb(
                         &job,
@@ -931,15 +802,15 @@ impl Guest {
                     )
                     .is_ok()
                 {
-                    loaded += 1;
+                    loaded.fetch_add(1, Ordering::Relaxed);
                 }
                 pb.inc(1);
-            }
+            });
 
             pb.finish_and_clear();
         }
 
-        Ok(loaded)
+        Ok(loaded.load(Ordering::Relaxed))
     }
 
     pub fn load_all_process_module_symbols(
@@ -955,7 +826,7 @@ impl Guest {
 
         let mut jobs_with_info: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
         let mut already_loaded: Vec<(DownloadJob, u128, ModuleInfo)> = Vec::new();
-        let mut loaded = 0;
+        let loaded = AtomicUsize::new(0);
 
         for module in &modules {
             if let Ok(Some((job, guid))) =
@@ -981,11 +852,16 @@ impl Guest {
                     .progress_chars("#-"),
             );
 
-            for (job, guid, module) in already_loaded.iter().chain(jobs_with_info.iter()) {
+            let all_jobs = already_loaded
+                .into_iter()
+                .chain(jobs_with_info.into_iter())
+                .collect::<Vec<_>>();
+
+            all_jobs.into_par_iter().for_each(|(job, guid, module)| {
                 if symbols
                     .load_downloaded_pdb(
-                        job,
-                        *guid,
+                        &job,
+                        guid,
                         &module.name,
                         module.base_address,
                         module.size,
@@ -993,14 +869,15 @@ impl Guest {
                     )
                     .is_ok()
                 {
-                    loaded += 1;
+                    loaded.fetch_add(1, Ordering::Relaxed);
                 }
+
                 pb.inc(1);
-            }
+            });
 
             pb.finish_and_clear();
         }
 
-        Ok(loaded)
+        Ok(loaded.load(Ordering::Relaxed))
     }
 }
