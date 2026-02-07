@@ -57,16 +57,13 @@ To view command line arguments, run `ntoseye --help`. The debugger is self docum
 
 Many features depend on `gdbstub` being enabled, so its recommended that it is enabled.
 
-It is recommended to disable memory paging and memory compression within the guest operating system to avoid memory-related issues.
-
-Steps:
-1. Command Prompt (Run as Administrator):
+It is recommended to disable memory paging and memory compression within the guest operating system to avoid memory-related issues. This only needs to be done once per Windows installation. Run the following commands in PowerShell (Run as Administrator):
 ```
-wmic computersystem where name="%computername%" set AutomaticManagedPagefile=False
-wmic pagefileset delete
+Get-CimInstance Win32_ComputerSystem | Set-CimInstance -Property @{ AutomaticManagedPagefile = $false }
+Get-CimInstance Win32_PageFileSetting | Remove-CimInstance
+Disable-MMAgent -MemoryCompression
+Restart-Computer
 ```
-2. PowerShell (Run as Administrator): `Disable-MMAgent -MemoryCompression`
-3. Reboot guest
 
 #### QEMU
 
