@@ -65,8 +65,8 @@ Steps:
 wmic computersystem where name="%computername%" set AutomaticManagedPagefile=False
 wmic pagefileset delete
 ```
-PowerShell (Run as Administrator): `Disable-MMAgent -MemoryCompression`
-3. Reboot: `Restart-Computer`
+2. PowerShell (Run as Administrator): `Disable-MMAgent -MemoryCompression`
+3. Reboot guest
 
 #### QEMU
 
