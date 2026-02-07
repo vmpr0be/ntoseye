@@ -121,18 +121,58 @@ impl<'a, B: MemoryOps<PhysAddr>> AddressSpace<'a, B> {
 
 impl<'a, B: MemoryOps<PhysAddr>> MemoryOps<VirtAddr> for AddressSpace<'a, B> {
     fn read_bytes(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<()> {
-        let xlat = self
-            .virt_to_phys(addr)?
-            .ok_or(Error::BadVirtualAddress(addr))?;
+        let mut offset = 0;
 
-        self.backend.read_bytes(xlat.address, buf)
+        while offset < buf.len() {
+            let curr_vaddr = addr + offset as u64;
+
+            let translation = match self.virt_to_phys(curr_vaddr)? {
+                Some(translation) => translation,
+                None => {
+                    if offset > 0 {
+                        return Err(Error::PartialRead(offset));
+                    } else {
+                        return Err(Error::BadVirtualAddress(curr_vaddr));
+                    }
+                }
+            };
+
+            let bytes_available = PAGE_SIZE - curr_vaddr.page_offset() as usize;
+            let chunk_size = (buf.len() - offset).min(bytes_available);
+
+            self.backend
+                .read_bytes(translation.address, &mut buf[offset..offset + chunk_size])?;
+            offset += chunk_size;
+        }
+
+        Ok(())
     }
 
     fn write_bytes(&self, addr: VirtAddr, buf: &[u8]) -> Result<()> {
-        let xlat = self
-            .virt_to_phys(addr)?
-            .ok_or(Error::BadVirtualAddress(addr))?;
+        let mut offset = 0;
 
-        self.backend.write_bytes(xlat.address, buf)
+        while offset < buf.len() {
+            let curr_vaddr = addr + offset as u64;
+
+            let translation = match self.virt_to_phys(curr_vaddr)? {
+                Some(translation) => translation,
+                None => {
+                    if offset > 0 {
+                        return Err(Error::PartialWrite(offset));
+                    } else {
+                        return Err(Error::BadVirtualAddress(curr_vaddr));
+                    }
+                }
+            };
+
+            let bytes_available = PAGE_SIZE - curr_vaddr.page_offset() as usize;
+            let chunk_size = (buf.len() - offset).min(bytes_available);
+
+            self.backend
+                .write_bytes(translation.address, &buf[offset..offset + chunk_size])?;
+            offset += chunk_size;
+        }
+
+        Ok(())
     }
 }
